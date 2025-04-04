@@ -33,6 +33,14 @@
         } \
     } while (0)
 
+#define CLOSE_LOGGER() \
+    do { \
+        if (logger) { \
+            logger_close(logger); \
+            logger = NULL; \
+        } \
+    } while (0)
+
 /* Log levels definition */
 typedef enum {
     LOG_LEVEL_DEBUG,

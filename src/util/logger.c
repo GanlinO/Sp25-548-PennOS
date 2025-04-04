@@ -33,7 +33,7 @@ Logger* logger_init(const char* name, LogLevel level) {
     char file_path[512];
     snprintf(file_path, sizeof(file_path), "%s/%s.log", log_dir, name);
     
-    logger->fp = fopen(file_path, "a");
+    logger->fp = fopen(file_path, "w");
     if (!logger->fp) {
         free(logger);
         return NULL;

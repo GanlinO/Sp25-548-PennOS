@@ -5,7 +5,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-#include "./spthread.h"
+#include "../src/util/spthread.h"
 
 #define NUM_THREADS 4
 #define BUF_SIZE 4096
