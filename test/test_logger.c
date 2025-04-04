@@ -8,7 +8,9 @@ static Logger *logger = NULL;
 
 int main(void) {
     // Initialize a logger with the name "test_logger" and DEBUG level
-    logger = logger_init("test_logger", LOG_LEVEL_DEBUG);
+    LOGGER_INIT("test_logger");
+
+    // Check if the logger was initialized successfully
     if (logger == NULL) {
         fprintf(stderr, "Failed to initialize logger.\n");
         return EXIT_FAILURE;
@@ -24,7 +26,7 @@ int main(void) {
     LOG_INFO("Testing formatted logging: %s, %d, %.2f", "string", 42, 3.14);
 
     // Close the logger to flush and release resources
-    CLOSE_LOGGER();
+    LOGGER_CLOSE();
 
     printf("Test complete. Check logs/test_logger.log for logged messages.\n");
     return EXIT_SUCCESS;

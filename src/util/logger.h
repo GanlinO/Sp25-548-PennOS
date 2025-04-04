@@ -33,7 +33,17 @@
         } \
     } while (0)
 
-#define CLOSE_LOGGER() \
+#define LOGGER_INIT(module_name) \
+    do { \
+        logger = logger_init(module_name, LOG_LEVEL_DEBUG); \
+        if (!logger) { \
+            fprintf(stderr, "Logger initialization failed for module '%s'!\n", module_name); \
+        } else { \
+            LOG_INFO("Logger successfully initialized for module '%s'.", module_name); \
+        } \
+    } while (0)
+
+#define LOGGER_CLOSE() \
     do { \
         if (logger) { \
             logger_close(logger); \
