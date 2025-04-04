@@ -15,6 +15,21 @@
 #define F_SEEK_CUR 1
 #define F_SEEK_END 2
 
+/* FAT Error Codes */
+enum PennFatErr
+{
+    PennFatErr_SUCCESS      = 0,
+    PennFatErr_INTERNAL     = -1,
+    PennFatErr_NOT_MOUNTED  = -2,
+    PennFatErr_INVAD        = -3,
+    PennFatErr_EXISTS       = -4,
+    PennFatErr_PERM         = -7,
+    PennFatErr_INUSE        = -8,
+    PennFatErr_NOSPACE      = -9,
+    PennFatErr_OUTOFMEM     = -10
+};
+typedef enum PennFatErr PennFatErr;
+
 /* Kernel-Level API */
 int k_open(const char *fname, int mode);
 int k_close(int fd);

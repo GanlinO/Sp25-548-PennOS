@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 
 static inline void skip_word(const char **const cur, const char *const end) {
@@ -208,8 +209,6 @@ PROCESS_ERROR:
     free(pcmd);
     return ret_code;
 }
-
-#include <stdio.h>
 
 void print_parsed_command(const struct parsed_command *const cmd) {
     for (size_t i = 0; i < cmd->num_commands; ++i) {
