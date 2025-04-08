@@ -1,9 +1,18 @@
-#include "pennfat_kernel.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <time.h>
-#include "../util/logger.h"  // Include logger for logging purposes
+#include <errno.h>  // IWYU pragma: keep [errno]
+
+#include <sys/types.h>
+#include <sys/mman.h>
+
+#include "pennfat_kernel.h"
+#include "../common/pennfat_errors.h"
+#include "../common/pennfat_definitions.h"
+#include "../util/logger.h"
 
 
 // ---------------------------------------------------------------------------
@@ -15,20 +24,13 @@ static Logger *logger = NULL;
 
 /* Initialization function: call this from your main application */
 void pennfat_kernel_init(void) {
-    logger = logger_init("pennfat_kernel", LOG_LEVEL_DEBUG);
-    if (!logger) {
-        fprintf(stderr, "Logger initialization failed in pennfat_kernel!\n");
-    } else {
-        LOG_INFO("Logger successfully initialized.");
-    }
+    LOGGER_INIT("pennfat_kernel", LOG_LEVEL_DEBUG);
 }
 
 /* Cleanup function: call this during application shutdown */
 void pennfat_kernel_cleanup(void) {
-    if (logger) {
-        logger_close(logger);
-        logger = NULL;
-    }
+    LOGGER_CLOSE();
+    printf("PennFAT kernel module cleaned up.\n");
 }
 
 
@@ -44,6 +46,9 @@ void pennfat_kernel_cleanup(void) {
 #define MAX_SYSTEM_FILES 64  // Subject to chanage; maximum number of system-wide file entries
 #define MAX_FD 32            // Subject to change; max number of open file descriptors
 #define MAX_DIR_ENTRIES 128  // Subject to change; maximum number of entries in the root directory
+
+/* Allowed block sizes mapping */
+static const int block_sizes[] = {256, 512, 1024, 2048, 4096};
 
 
 // ---------------------------------------------------------------------------
@@ -62,30 +67,33 @@ typedef struct {
 static system_file_t g_sysfile_table[MAX_SYSTEM_FILES];
 
 /* File Descriptor Table Entry */
-typedef struct {
-    bool     in_use;        // FD slot is active
-    int      sysfile_index; // Index into system-wide file table
-    int      mode;          // F_READ, F_WRITE, or F_APPEND
-    uint32_t offset;        // Current file pointer offset
-} fd_entry_t;
+// typedef struct {
+//     bool     in_use;        // FD slot is active
+//     int      sysfile_index; // Index into system-wide file table
+//     int      mode;          // F_READ, F_WRITE, or F_APPEND
+//     uint32_t offset;        // Current file pointer offset
+// } fd_entry_t;
 static fd_entry_t g_fd_table[MAX_FD];
 
-/* Directory Entry Structure */
-typedef struct {
-    char     filename[32];  // Null-terminated filename
-    uint16_t first_block;   // Starting block in FAT
-    uint32_t size;          // File size in bytes
-    uint16_t perms;         // Permissions (TODO: for now, just a placeholder, e.g., "rw-")
-    time_t   mtime;         // Last modification time
-} dir_entry_t;
-static dir_entry_t g_root_dir[MAX_DIR_ENTRIES];
+/* PennFAT directory entry: fixed 64 bytes */
+// typedef struct {
+//     char     name[32];     // 32-byte null-terminated file name.
+//                            // Special markers: 0 = end of directory, 1 = deleted, 2 = deleted but in use.
+//     uint32_t size;         // 4 bytes: file size in bytes.
+//     uint16_t first_block;   // 2 bytes: first block number (undefined if size is zero).
+//     uint8_t  type;         // 1 byte: file type (0: unknown, 1: regular, 2: directory, 4: symbolic link).
+//     uint8_t  perm;         // 1 byte: permissions (0, 2, 4, 5, 6, or 7).
+//     time_t   mtime;        // 8 bytes: creation/modification time.
+//     char     reserved[16]; // 16 bytes reserved.
+// } __attribute__((packed)) dir_entry_t;  // Ensure no padding
+static dir_entry_t *g_root_dir;
 
 /* FAT Array (in memory) */
 static uint16_t *g_fat = NULL;
 
 /* Superblock Structure */
 typedef struct {
-    uint32_t magic;
+    // uint32_t magic;
     uint32_t block_size;       // Bytes per block
     uint32_t fat_start_block;  // Starting block of FAT region
     uint32_t fat_block_count;  // Number of blocks for FAT
@@ -96,32 +104,50 @@ typedef struct {
 static superblock_t g_superblock;
 
 /* Global variables for host FS access and mounting */
-static FILE *g_fs_fp = NULL;
-static int   g_mounted = 0;
-static uint32_t g_block_size = 512;  // Default; overwritten by superblock
+static int g_mounted = 0;
+static int g_fs_fd = -1;
+static uint32_t g_block_size = 0;  // actual block size (computed from block_size_config)
 
 
 // ---------------------------------------------------------------------------
 // 3) HELPER ROUTINES
 // ---------------------------------------------------------------------------
 
-/* read_block: Reads a block from the underlying FS */
-static int read_block(void *buf, uint32_t block_index) {
-    if (!g_fs_fp) return -1;
-    if (fseek(g_fs_fp, block_index * g_block_size, SEEK_SET) != 0)
+/* 
+ * read_block: Reads a block from the underlying filesystem using the file descriptor.
+ * It calculates the offset as block_index * g_block_size.
+ */
+ static int read_block(void *buf, uint32_t block_index) {
+    if (g_fs_fd < 0)
         return -1;
-    if (fread(buf, 1, g_block_size, g_fs_fp) != g_block_size)
+    
+    off_t offset = block_index * g_block_size;
+    if (lseek(g_fs_fd, offset, SEEK_SET) < 0)
         return -1;
+    
+    ssize_t bytes_read = read(g_fs_fd, buf, g_block_size);
+    if (bytes_read != g_block_size)
+        return -1;
+    
     return 0;
 }
 
-/* write_block: Writes a block to the underlying FS */
+/* 
+ * write_block: Writes a block to the underlying filesystem using the file descriptor.
+ * It computes the offset as block_index * g_block_size and writes exactly g_block_size bytes.
+ */
 static int write_block(const void *buf, uint32_t block_index) {
-    if (!g_fs_fp) return -1;
-    if (fseek(g_fs_fp, block_index * g_block_size, SEEK_SET) != 0)
+    if (g_fs_fd < 0)
         return -1;
-    if (fwrite(buf, 1, g_block_size, g_fs_fp) != g_block_size)
+    
+    off_t offset = block_index * g_block_size;
+    if (lseek(g_fs_fd, offset, SEEK_SET) < 0)
         return -1;
+    
+    ssize_t bytes_written = write(g_fs_fd, buf, g_block_size);
+    if (bytes_written != g_block_size)
+        return -1;
+    
     return 0;
 }
 
@@ -223,7 +249,7 @@ static void release_sysfile_entry(int sys_idx) {
  *               file if exists; additionally, the file pointer references the
  *               end of the file
  */
-int k_open(const char *fname, int mode) {
+PennFatErr k_open(const char *fname, int mode) {
     if (!g_mounted) {
         LOG_WARN("[k_open] Failed to open file '%s': Filesystem not mounted.", fname);
         return PennFatErr_NOT_MOUNTED; 
@@ -231,13 +257,13 @@ int k_open(const char *fname, int mode) {
 
     int found_idx = -1, free_idx = -1;
     for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
-        if (g_root_dir[i].filename[0] == '\0') {
+        if (g_root_dir[i].name[0] == '\0') {
             if (free_idx < 0) {
                 free_idx = i;
                 LOG_DEBUG("[k_open] Found free directory entry at index %d for file '%s'.", i, fname);
             }
                 
-        } else if (strncmp(g_root_dir[i].filename, fname, sizeof(g_root_dir[i].filename)) == 0) {
+        } else if (strncmp(g_root_dir[i].name, fname, sizeof(g_root_dir[i].name)) == 0) {
             found_idx = i;
             LOG_DEBUG("[k_open] Found existing file entry at index %d for file '%s'.", i, fname);
             break;
@@ -256,8 +282,8 @@ int k_open(const char *fname, int mode) {
 
         found_idx = free_idx;
         memset(&g_root_dir[found_idx], 0, sizeof(dir_entry_t));
-        strncpy(g_root_dir[found_idx].filename, fname, sizeof(g_root_dir[found_idx].filename) - 1);
-        g_root_dir[found_idx].filename[sizeof(g_root_dir[found_idx].filename) - 1] = '\0';
+        strncpy(g_root_dir[found_idx].name, fname, sizeof(g_root_dir[found_idx].name) - 1);
+        g_root_dir[found_idx].name[sizeof(g_root_dir[found_idx].name) - 1] = '\0';
         g_root_dir[found_idx].size = 0;
         g_root_dir[found_idx].mtime = time(NULL);
         int new_blk = allocate_free_block();
@@ -328,7 +354,7 @@ int k_open(const char *fname, int mode) {
  * Read n bytes from the file referenced by fd. On return, k_read returns the
  * number of bytes read, 0 if EOF is reached, or a negative number on error.
  */
-int k_read(int fd, int n, char *buf) {
+PennFatErr k_read(int fd, int n, char *buf) {
     if (!g_mounted) {
         LOG_WARN("[k_read] Failed to read from file descriptor %d: Filesystem not mounted.", fd);
         return PennFatErr_NOT_MOUNTED;
@@ -398,7 +424,7 @@ int k_read(int fd, int n, char *buf) {
  * written, or a negative value on error. Note that this writes bytes not chars,
  * these can be anything, even '\0'.
  */
-int k_write(int fd, const char *buf, int n) {
+PennFatErr k_write(int fd, const char *buf, int n) {
     if (!g_mounted) {
         LOG_WARN("[k_write] Failed to write to file descriptor %d: Filesystem not mounted.", fd);
         return PennFatErr_NOT_MOUNTED;
@@ -475,7 +501,7 @@ int k_write(int fd, const char *buf, int n) {
 /**
  * Close the file fd and return 0 on success, or a negative value on failure.
  */
-int k_close(int fd) {
+PennFatErr k_close(int fd) {
     if (!g_mounted) {
         LOG_WARN("[k_close] Failed to close file descriptor %d: Filesystem not mounted.", fd);
         return PennFatErr_NOT_MOUNTED;
@@ -503,7 +529,7 @@ int k_close(int fd) {
  * the previous data in the data region, but should at least note this area as
  * ‘nullified’ or fresh and ready to write to, elsewhere. 
  */
-int k_unlink(const char *fname) {
+PennFatErr k_unlink(const char *fname) {
     if (!g_mounted) {
         LOG_WARN("[k_unlink] Failed to unlink file '%s': Filesystem not mounted.", fname);
         return PennFatErr_NOT_MOUNTED; 
@@ -511,7 +537,7 @@ int k_unlink(const char *fname) {
 
     int dir_index = -1;
     for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
-        if (strncmp(g_root_dir[i].filename, fname, sizeof(g_root_dir[i].filename)) == 0) {
+        if (strncmp(g_root_dir[i].name, fname, sizeof(g_root_dir[i].name)) == 0) {
             dir_index = i;
             break;
         }
@@ -549,7 +575,7 @@ int k_unlink(const char *fname) {
  * in lseek(2). Note that this could require updates to the metadata of the file,
  * for example, if the new position of n exceeds the files previous filesize!
  */
-int k_lseek(int fd, int offset, int whence) {
+PennFatErr k_lseek(int fd, int offset, int whence) {
     if (!g_mounted) {
         LOG_WARN("[k_lseek] Failed to seek in file descriptor %d: Filesystem not mounted.", fd);
         return PennFatErr_NOT_MOUNTED;
@@ -602,7 +628,7 @@ int k_lseek(int fd, int offset, int whence) {
  * the time being, chmod will be required to be implemented later), size, latest
  * modification timestamp and filename.
  */
- int k_ls(const char *fname) {
+PennFatErr k_ls(const char *fname) {
     if (!g_mounted) {
         LOG_WARN("[k_ls] Failed to list files: Filesystem not mounted.");
         return PennFatErr_NOT_MOUNTED; 
@@ -614,13 +640,13 @@ int k_lseek(int fd, int offset, int whence) {
 
     if (fname && fname[0] != '\0') {
         for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
-            if (strncmp(g_root_dir[i].filename, fname, sizeof(g_root_dir[i].filename)) == 0) {
+            if (strncmp(g_root_dir[i].name, fname, sizeof(g_root_dir[i].name)) == 0) {
                 tm_info = localtime(&g_root_dir[i].mtime);
                 strftime(time_buf, sizeof(time_buf), "%b %d %H:%M", tm_info);
 
                 // TODO: [Permissions] using a placeholder "rw-" for now
                 printf("%5u  %-4s  %10u  %s  %s\n", 
-                       g_root_dir[i].first_block, "rw-", g_root_dir[i].size, time_buf, g_root_dir[i].filename);
+                       g_root_dir[i].first_block, "rw-", g_root_dir[i].size, time_buf, g_root_dir[i].name);
                 return 0;
             }
         }
@@ -629,11 +655,11 @@ int k_lseek(int fd, int offset, int whence) {
         return PennFatErr_EXISTS;
     } else {
         for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
-            if (g_root_dir[i].filename[0] != '\0') {
+            if (g_root_dir[i].name[0] != '\0') {
                 tm_info = localtime(&g_root_dir[i].mtime);
                 strftime(time_buf, sizeof(time_buf), "%b %d %H:%M", tm_info);
                 printf("%5u  %-4s  %10u  %s  %s\n", 
-                       g_root_dir[i].first_block, "rw-", g_root_dir[i].size, time_buf, g_root_dir[i].filename);
+                       g_root_dir[i].first_block, "rw-", g_root_dir[i].size, time_buf, g_root_dir[i].name);
             }
         }
         return 0;
@@ -642,78 +668,322 @@ int k_lseek(int fd, int offset, int whence) {
 
 /* --- Mount/Unmount Functions --- */
 
-int mount_fs(const char *fs_name) {
+/*
+ * mount: Mounts the PennFAT filesystem.
+ * The FAT region (of predetermined size) is mapped starting at offset 0.
+ * The superblock functionality is implemented by reading FAT[0]:
+ *   - The least-significant byte (LSB) is the block_size_config.
+ *   - The most-significant byte (MSB) is the number of FAT blocks.
+ * Based on that, we compute g_block_size and the FAT region size, and then
+ * read the root directory from the first data block.
+ */
+PennFatErr k_mount(const char *fs_name) {
     if (g_mounted) {
-        fprintf(stderr, "Filesystem already mounted.\n");
-        return -1;
+        LOG_WARN("[k_mount] Failed to mount filesystem '%s': Already mounted.", fs_name);
+        return PennFatErr_UNEXPCMD;
     }
-    g_fs_fp = fopen(fs_name, "rb+");
-    if (!g_fs_fp) {
-        perror("fopen");
-        return -1;
+
+    /* Open the filesystem file using open(2) for read/write */
+    int fd = open(fs_name, O_RDWR);
+    if (fd < 0) {
+        LOG_CRIT("[k_mount] Failed to open filesystem file '%s': %s", fs_name, strerror(errno));
+        return PennFatErr_INTERNAL;
     }
-    if (fread(&g_superblock, sizeof(superblock_t), 1, g_fs_fp) != 1) {
-        fclose(g_fs_fp);
-        g_fs_fp = NULL;
-        return -1;
+    g_fs_fd = fd;
+
+    /* Read the first 2 bytes from the file to get FAT[0] (the superblock info) */
+    uint16_t super_entry;
+    ssize_t rd = read(fd, &super_entry, sizeof(super_entry));
+    if (rd != sizeof(super_entry)) {
+        LOG_CRIT("[k_mount] Failed to read superblock from filesystem file '%s': %s", fs_name, strerror(errno));
+        close(fd);
+        return PennFatErr_INTERNAL;
     }
-    g_block_size = g_superblock.block_size;
-    uint32_t fat_bytes = g_superblock.fat_block_count * g_block_size;
-    g_fat = (uint16_t *)malloc(fat_bytes);
-    if (!g_fat) {
-        fclose(g_fs_fp);
-        return -1;
+
+    /* Interpret FAT[0] in little-endian format:
+       - LSB (lower 8 bits) is block_size_config (0–4).
+       - MSB (upper 8 bits) is the number of FAT blocks.
+    */
+    uint8_t block_size_config = super_entry & 0xFF;
+    uint8_t fat_blocks = (super_entry >> 8) & 0xFF;
+    
+    if (block_size_config > 4) {
+        LOG_ERR("[k_mount] Invalid block size config: %u", block_size_config);
+        close(fd);
+        return PennFatErr_INVAD;
     }
-    if (fseek(g_fs_fp, g_superblock.fat_start_block * g_block_size, SEEK_SET) != 0) {
-        free(g_fat);
-        fclose(g_fs_fp);
-        return -1;
+    if (fat_blocks < 1 || fat_blocks > 32) {
+        LOG_ERR("[k_mount] Invalid number of FAT blocks: %u", fat_blocks);
+        close(fd);
+        return PennFatErr_INVAD;
     }
-    if (fread(g_fat, 1, fat_bytes, g_fs_fp) != fat_bytes) {
-        free(g_fat);
-        fclose(g_fs_fp);
-        return -1;
+
+    /* Compute the actual block size */
+    g_block_size = block_sizes[block_size_config];
+    
+    /* Compute the FAT region size (in bytes) */
+    uint32_t fat_region_size = fat_blocks * g_block_size;
+
+    LOG_DEBUG("[k_mount] Mounting filesystem '%s' with block size %u bytes and %u FAT blocks.",
+              fs_name, g_block_size, fat_blocks);
+
+    /* Map the FAT region into memory using mmap(2).
+       The FAT region is stored at offset 0.
+    */
+    g_fat = mmap(NULL, fat_region_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (g_fat == MAP_FAILED) {
+        LOG_CRIT("[k_mount] Failed to map FAT region from filesystem file '%s': %s", fs_name, strerror(errno));
+        close(fd);
+        return PennFatErr_INTERNAL;
     }
-    uint32_t root_bytes = g_superblock.root_block_count * g_block_size;
-    if (fseek(g_fs_fp, g_superblock.root_start_block * g_block_size, SEEK_SET) != 0) {
-        free(g_fat);
-        fclose(g_fs_fp);
-        return -1;
+
+    /* Optionally verify that the mapped FAT[0] matches the super_entry we read */
+    if (g_fat[0] != super_entry) {
+        LOG_CRIT("[k_mount] FAT[0] mismatch: expected 0x%04x, got 0x%04x", super_entry, g_fat[0]);
+        munmap(g_fat, fat_region_size);
+        close(fd);
+        return PennFatErr_INTERNAL;
     }
-    if (fread(g_root_dir, 1, root_bytes, g_fs_fp) != root_bytes) {
-        free(g_fat);
-        fclose(g_fs_fp);
-        return -1;
+
+     /* Read the root directory region.
+       According to our mkfs, the root directory is stored in the first data block,
+       which immediately follows the FAT region. Its size is one block (g_block_size bytes).
+       Compute the offset for the root directory:
+           root_offset = fat_region_size
+    */
+    off_t root_offset = fat_region_size;
+    g_root_dir = malloc(g_block_size);
+    if (!g_root_dir) {
+        LOG_CRIT("[k_mount] Failed to allocate memory for root directory: %s", strerror(errno));
+        munmap(g_fat, fat_region_size);
+        close(fd);
+        return PennFatErr_OUTOFMEM;
     }
+    
+    if (lseek(fd, root_offset, SEEK_SET) < 0) {
+        LOG_CRIT("[k_mount] Failed to seek to root directory in filesystem file '%s': %s", fs_name, strerror(errno));
+        free(g_root_dir);
+        munmap(g_fat, fat_region_size);
+        close(fd);
+        return PennFatErr_INTERNAL;
+    }
+    
+    if (read(fd, g_root_dir, g_block_size) != (ssize_t)g_block_size) {
+        LOG_CRIT("[k_mount] Failed to read root directory from filesystem file '%s': %s", fs_name, strerror(errno));
+        free(g_root_dir);
+        munmap(g_fat, fat_region_size);
+        close(fd);
+        return PennFatErr_INTERNAL;
+    }
+
+    LOG_DEBUG("[k_mount] Successfully read root directory from offset %u in filesystem file '%s'.",
+              root_offset, fs_name);
+
+    /* Clear system-wide and FD tables (if necessary) */
     memset(g_sysfile_table, 0, sizeof(g_sysfile_table));
     memset(g_fd_table, 0, sizeof(g_fd_table));
+
+    LOG_INFO("[k_mount] Successfully mounted filesystem '%s' with block size %u bytes.", fs_name, g_block_size);
+
     g_mounted = 1;
+    return PennFatErr_SUCCESS;
+}
+
+/* unmount: Writes back the FAT and root directory to disk, then unmaps and closes the FS */
+PennFatErr k_unmount(void) {
+    if (!g_mounted) {
+        LOG_WARN("[k_unmount] Failed to unmount filesystem: Not mounted.");
+        return PennFatErr_NOT_MOUNTED;
+    }
+
+    /* Recompute FAT region size:
+       FAT[0] contains the formatting info:
+         MSB = number of FAT blocks
+       Calculate:
+         fat_blocks = (g_fat[0] >> 8) & 0xff
+         fat_region_size = fat_blocks * g_block_size
+    */
+    uint8_t fat_blocks = (g_fat[0] >> 8) & 0xff;
+    uint32_t fat_region_size = fat_blocks * g_block_size;
+
+    LOG_DEBUG("[k_unmount] Unmounting filesystem with %u FAT blocks, block size %u bytes.",
+              fat_blocks, g_block_size);
+
+    /* First, write back the root directory region.
+       The root directory is stored in the first data block, located at:
+           root_offset = fat_region_size (since FAT region occupies the first fat_region_size bytes)
+       The size of the root directory region is one block (g_block_size bytes).
+    */
+    off_t root_offset = fat_region_size;
+    if (lseek(g_fs_fd, root_offset, SEEK_SET) < 0) {
+        LOG_CRIT("[k_unmount] Failed to seek to root directory in filesystem file: %s", strerror(errno));
+        return PennFatErr_INTERNAL;
+    }
+    if (write(g_fs_fd, g_root_dir, g_block_size) != (ssize_t)g_block_size) {
+        LOG_CRIT("[k_unmount] Failed to write root directory to filesystem file: %s", strerror(errno));
+        return PennFatErr_INTERNAL;
+    }
+
+    /* Synchronize the mapped FAT region to disk */
+    if (msync(g_fat, fat_region_size, MS_SYNC) < 0) {
+        LOG_CRIT("[k_unmount] Failed to synchronize FAT region to disk: %s", strerror(errno));
+        return PennFatErr_INTERNAL;
+    }
+
+    /* Unmap the FAT region */
+    if (munmap(g_fat, fat_region_size) < 0) {
+        LOG_CRIT("[k_unmount] Failed to unmap FAT region: %s", strerror(errno));
+        return PennFatErr_INTERNAL;
+    }
+    g_fat = NULL;
+
+    /* Free the allocated root directory buffer */
+    free(g_root_dir);
+    g_root_dir = NULL;
+
+    /* Close the filesystem file */
+    if (close(g_fs_fd) < 0) {
+        LOG_ERR("[k_unmount] Failed to close filesystem file: %s", strerror(errno));
+        return -1;
+    }
+    g_fs_fd = -1;
+
+    LOG_INFO("[k_unmount] Successfully unmounted filesystem.");
+
+    g_mounted = 0;
     return 0;
 }
 
-int unmount_fs(void) {
-    if (!g_mounted) {
-        fprintf(stderr, "No filesystem is mounted.\n");
+/**
+ * mkfs: Creates a new PennFAT filesystem.
+ * Usage: mkfs FS_NAME BLOCKS_IN_FAT BLOCK_SIZE_CONFIG
+ *
+ * BLOCKS_IN_FAT must be between 1 and 32.
+ * BLOCK_SIZE_CONFIG must be between 0 and 4, which maps to:
+ *   0: 256 bytes, 1: 512 bytes, 2: 1024 bytes, 3: 2048 bytes, 4: 4096 bytes.
+ * 
+ * The FAT is placed at the very beginning of the filesystem image.
+ * The first FAT entry (FAT[0]) stores formatting info:
+ *     MSB = blocks_in_fat, LSB = block_size_config.
+ * FAT[1] is set to FAT_EOC, designating that the first data block (Block 1, which is
+ * the root directory file’s first block) is allocated.
+ * The data region size is: block_size * (number of FAT entries - 1).
+ */
+PennFatErr k_mkfs(const char *fs_name, int blocks_in_fat, int block_size_config) {
+    /* Check if a filesystem is already mounted */
+    if (g_mounted) {
+        LOG_WARN("[k_mkfs] Cannot create a new filesystem while one is already mounted.");
+        return PennFatErr_UNEXPCMD;
+    }
+    
+    /* Validate parameters */
+    if (blocks_in_fat < 1 || blocks_in_fat > 32) {
+        LOG_ERR("[k_mkfs] Invalid number of blocks in FAT. Must be between 1 and 32.");
+        return PennFatErr_INVAD;
+    }
+    if (block_size_config < 0 || block_size_config > 4) {
+        LOG_ERR("[k_mkfs] Invalid block size configuration. Must be between 0 and 4.");
+        return PennFatErr_INVAD;
+    }
+    uint32_t block_size = block_sizes[block_size_config];
+    
+    /* Calculate region sizes:
+     * FAT region size = blocks_in_fat * block_size.
+     * Number of FAT entries = FAT region size / 2.
+     * Data region size = block_size * (number of FAT entries - 1).
+     * Total FS size = FAT region size + Data region size.
+     */
+    uint32_t fat_region_size = blocks_in_fat * block_size;
+    uint32_t fat_entries = fat_region_size / sizeof(uint16_t);  // each entry is 2 bytes
+    uint32_t data_blocks = (fat_entries - 1) - ((fat_entries - 1) == 0xFFFF);  // subtract one for FAT[0]
+                                                                               // subtract one for xFFFF
+    uint32_t data_region_size = data_blocks * block_size;
+    uint32_t total_fs_size = fat_region_size + data_region_size;
+
+    LOG_DEBUG("[k_mkfs] Creating filesystem with %d blocks in FAT, block size %u bytes, total size %u bytes.",
+              blocks_in_fat, block_size, total_fs_size);
+
+    /* Open (or create) the filesystem file */
+    int fd = open(fs_name, O_RDWR | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) {
+        LOG_CRIT("[k_mkfs] Failed to open/create filesystem file '%s': %s", fs_name, strerror(errno));
+        return PennFatErr_INTERNAL;
+    }
+
+    /* Set the file size to total_fs_size bytes */
+    if (ftruncate(fd, total_fs_size) < 0) {
+        perror("mkfs: ftruncate");
+        close(fd);
         return -1;
     }
-    uint32_t fat_bytes = g_superblock.fat_block_count * g_block_size;
-    if (fseek(g_fs_fp, g_superblock.fat_start_block * g_block_size, SEEK_SET) != 0)
+    
+    /* Allocate and initialize the FAT array */
+    uint16_t *fat_array = malloc(fat_region_size);
+    if (!fat_array) {
+        perror("mkfs: malloc (fat_array)");
+        close(fd);
         return -1;
-    if (fwrite(g_fat, 1, fat_bytes, g_fs_fp) != fat_bytes)
+    }
+    uint32_t num_entries = fat_region_size / sizeof(uint16_t);
+    for (uint32_t i = 0; i < num_entries; i++) {
+        fat_array[i] = FAT_FREE;
+    }
+
+    /* Set formatting info in FAT[0]: 
+       MSB = blocks_in_fat, LSB = block_size_config.
+       For example, if blocks_in_fat = 32 and block_size_config = 4, FAT[0] = 0x2004.
+    */
+    fat_array[0] = ((uint16_t)blocks_in_fat << 8) | (uint16_t)block_size_config;
+
+    /* Set FAT[1] to FAT_EOC so that the root directory's first block is allocated and marked as the end of chain */
+    fat_array[1] = FAT_EOC;
+    
+    /* Write the FAT region at offset 0 */
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        perror("mkfs: lseek (FAT region)");
+        free(fat_array);
+        close(fd);
         return -1;
-    uint32_t root_bytes = g_superblock.root_block_count * g_block_size;
-    if (fseek(g_fs_fp, g_superblock.root_start_block * g_block_size, SEEK_SET) != 0)
+    }
+    if (write(fd, fat_array, fat_region_size) != fat_region_size) {
+        perror("mkfs: write (FAT region)");
+        free(fat_array);
+        close(fd);
         return -1;
-    if (fwrite(g_root_dir, 1, root_bytes, g_fs_fp) != root_bytes)
-        return -1;
-    if (fseek(g_fs_fp, 0, SEEK_SET) != 0)
-        return -1;
-    if (fwrite(&g_superblock, sizeof(superblock_t), 1, g_fs_fp) != 1)
-        return -1;
-    fclose(g_fs_fp);
-    g_fs_fp = NULL;
-    free(g_fat);
-    g_fat = NULL;
-    g_mounted = 0;
-    return 0;
+    }
+    free(fat_array);
+    
+    /* Initialize the root directory region.
+       The root directory is stored in the first data block (Block 1).
+       We'll zero out one block (block_size bytes) at offset = fat_region_size.
+       (If the entire FS image is already zeroed by ftruncate, this might be optional,
+       but it's good to explicitly set the root directory.)
+    */
+    char *zero_buf = calloc(1, block_size);
+    if (!zero_buf) {
+        LOG_CRIT("[k_mkfs] Failed to allocate memory for zero buffer.");
+        close(fd);
+        return PennFatErr_INTERNAL;
+    }
+    if (lseek(fd, fat_region_size, SEEK_SET) < 0) {
+        LOG_CRIT("[k_mkfs] Failed to seek to root directory region.");
+        free(zero_buf);
+        close(fd);
+        return PennFatErr_INTERNAL;
+    }
+    if (write(fd, zero_buf, block_size) != block_size) {
+        LOG_CRIT("[k_mkfs] Failed to write root directory region.");
+        free(zero_buf);
+        close(fd);
+        return PennFatErr_INTERNAL;
+    }
+    free(zero_buf);
+    
+    /* The data region can be left uninitialized or zeroed as needed. */
+
+    LOG_INFO("[k_mkfs] Created filesystem '%s' with %d blocks in FAT and block size %u bytes.",
+        fs_name, blocks_in_fat, block_size);
+
+    close(fd);
+    return PennFatErr_SUCCESS;
 }

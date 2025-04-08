@@ -33,9 +33,16 @@
         } \
     } while (0)
 
-#define LOGGER_INIT(module_name) \
+#define LOG_CRIT(fmt, ...) \
     do { \
-        logger = logger_init(module_name, LOG_LEVEL_DEBUG); \
+        if (logger) { \
+            logger_log(logger, LOG_LEVEL_CRITICAL, fmt, ##__VA_ARGS__); \
+        } \
+    } while (0)
+
+#define LOGGER_INIT(module_name, log_level) \
+    do { \
+        logger = logger_init(module_name, log_level); \
         if (!logger) { \
             fprintf(stderr, "Logger initialization failed for module '%s'!\n", module_name); \
         } else { \
@@ -56,7 +63,8 @@ typedef enum {
     LOG_LEVEL_DEBUG,
     LOG_LEVEL_INFO,
     LOG_LEVEL_WARN,
-    LOG_LEVEL_ERROR
+    LOG_LEVEL_ERROR,
+    LOG_LEVEL_CRITICAL,
 } LogLevel;
 
 /* Logger structure that holds file pointer, log level, and a name identifier */

@@ -63,6 +63,7 @@ void logger_log(Logger* logger, LogLevel level, const char* format, ...) {
         case LOG_LEVEL_INFO:  level_str = "INFO";  break;
         case LOG_LEVEL_WARN:  level_str = "WARN";  break;
         case LOG_LEVEL_ERROR: level_str = "ERROR"; break;
+        case LOG_LEVEL_CRITICAL: level_str = "CRITICAL"; break;
         default: level_str = "INFO"; break;
     }
     
