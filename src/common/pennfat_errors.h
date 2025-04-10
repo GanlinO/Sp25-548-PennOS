@@ -28,7 +28,7 @@ static const char * const pennFatErrStrings[PENNFAT_ERR_COUNT] = {
     "No space left on device",
     "File in use",
     "Permission denied",
-    "File already exists",
+    "File existance error",
     "Invalid argument",
     "File system not mounted",
     "Internal error",

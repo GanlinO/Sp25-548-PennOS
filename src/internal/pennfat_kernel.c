@@ -18,6 +18,8 @@
 // ---------------------------------------------------------------------------
 // 0) LOGGING PURPOSEES
 // ---------------------------------------------------------------------------
+/* 1 if a filesystem is mounted; 0 otherwise */
+static int g_mounted = 0;  // put it here for cleanup reference
 
 /* Static logger pointer for this module */
 static Logger *logger = NULL;
@@ -30,6 +32,10 @@ void pennfat_kernel_init(void) {
 /* Cleanup function: call this during application shutdown */
 void pennfat_kernel_cleanup(void) {
     LOGGER_CLOSE();
+
+    if (g_mounted) {
+        k_unmount();
+    }
     printf("PennFAT kernel module cleaned up.\n");
 }
 
@@ -52,70 +58,45 @@ static const int block_sizes[] = {256, 512, 1024, 2048, 4096};
 
 
 // ---------------------------------------------------------------------------
-// 2) DATA STRUCTURES
+// 2) GLOBAL DATA STRUCTURES
 // ---------------------------------------------------------------------------
 
-/* System-Wide File Table Entry */
-typedef struct {
-    int      ref_count;   // Number of FDs referencing this file
-    bool     in_use;      // Whether this entry is active
-    uint16_t first_block; // Starting block (from directory)
-    uint32_t size;        // File size in bytes
-    time_t   mtime;       // Last modification time
-    int      dir_index;   // Index in the directory array
-} system_file_t;
-static system_file_t g_sysfile_table[MAX_SYSTEM_FILES];
+// static int g_mounted = 0;            // 1 if a filesystem is mounted; 0 otherwise
+static int g_fs_fd = -1;                // File descriptor for the FS image
+static uint32_t g_block_size = 512;     // Actual block size (set during mount)
+static uint16_t *g_fat = NULL;          // Pointer to the mapped FAT region
+static dir_entry_t *g_root_dir = NULL;  // Pointer to the root directory block (1 block)
 
-/* File Descriptor Table Entry */
-// typedef struct {
-//     bool     in_use;        // FD slot is active
-//     int      sysfile_index; // Index into system-wide file table
-//     int      mode;          // F_READ, F_WRITE, or F_APPEND
-//     uint32_t offset;        // Current file pointer offset
-// } fd_entry_t;
-static fd_entry_t g_fd_table[MAX_FD];
 
-/* PennFAT directory entry: fixed 64 bytes */
-// typedef struct {
-//     char     name[32];     // 32-byte null-terminated file name.
-//                            // Special markers: 0 = end of directory, 1 = deleted, 2 = deleted but in use.
-//     uint32_t size;         // 4 bytes: file size in bytes.
-//     uint16_t first_block;   // 2 bytes: first block number (undefined if size is zero).
-//     uint8_t  type;         // 1 byte: file type (0: unknown, 1: regular, 2: directory, 4: symbolic link).
-//     uint8_t  perm;         // 1 byte: permissions (0, 2, 4, 5, 6, or 7).
-//     time_t   mtime;        // 8 bytes: creation/modification time.
-//     char     reserved[16]; // 16 bytes reserved.
-// } __attribute__((packed)) dir_entry_t;  // Ensure no padding
-static dir_entry_t *g_root_dir;
-
-/* FAT Array (in memory) */
-static uint16_t *g_fat = NULL;
-
-/* Superblock Structure */
-typedef struct {
-    // uint32_t magic;
-    uint32_t block_size;       // Bytes per block
-    uint32_t fat_start_block;  // Starting block of FAT region
-    uint32_t fat_block_count;  // Number of blocks for FAT
-    uint32_t root_start_block; // Starting block of root directory
-    uint32_t root_block_count; // Number of blocks for directory
-    uint32_t data_start_block; // Starting block of data region
+/* The superblock info is embedded in FAT[0]:
+ * MSB = number of FAT blocks; LSB = block_size_config.
+ * For helper routines we store parsed info here:
+ */
+ typedef struct {
+    uint32_t fat_block_count;  /* number of FAT blocks (from FAT[0]'s MSB) */
+    uint32_t data_start_block; /* computed: FAT region size in blocks */
 } superblock_t;
 static superblock_t g_superblock;
 
-/* Global variables for host FS access and mounting */
-static int g_mounted = 0;
-static int g_fs_fd = -1;
-static uint32_t g_block_size = 0;  // actual block size (computed from block_size_config)
+/* Global arrays for our system-wide file table and FD table */
+static system_file_t g_sysfile_table[MAX_SYSTEM_FILES];
+static fd_entry_t g_fd_table[MAX_FD];
 
 
 // ---------------------------------------------------------------------------
 // 3) HELPER ROUTINES
 // ---------------------------------------------------------------------------
 
+static inline void perm_to_str(uint8_t perm, char *str) {
+    str[0] = (perm & PERM_READ)  ? 'r' : '-';
+    str[1] = (perm & PERM_WRITE) ? 'w' : '-';
+    str[2] = (perm & PERM_EXEC)  ? 'x' : '-';
+    str[3] = '\0';
+}
+
 /* 
- * read_block: Reads a block from the underlying filesystem using the file descriptor.
- * It calculates the offset as block_index * g_block_size.
+ * read_block: Reads a block from the FS image using g_fs_fd.
+ * Calculates offset = block_index * g_block_size.
  */
  static int read_block(void *buf, uint32_t block_index) {
     if (g_fs_fd < 0)
@@ -133,8 +114,8 @@ static uint32_t g_block_size = 0;  // actual block size (computed from block_siz
 }
 
 /* 
- * write_block: Writes a block to the underlying filesystem using the file descriptor.
- * It computes the offset as block_index * g_block_size and writes exactly g_block_size bytes.
+ * write_block: Writes a block to the FS image using g_fs_fd.
+ * Computes offset = block_index * g_block_size.
  */
 static int write_block(const void *buf, uint32_t block_index) {
     if (g_fs_fd < 0)
@@ -151,26 +132,35 @@ static int write_block(const void *buf, uint32_t block_index) {
     return 0;
 }
 
-/* locate_block_in_chain: Given a file offset, find the physical block and offset */
+/*
+ * locate_block_in_chain: Given a file offset, finds the physical block and the
+ * offset within that block, by walking the FAT chain starting at start_block.
+ */
 static int locate_block_in_chain(uint16_t start_block,
                                  uint32_t file_offset,
                                  uint16_t *block_out,
                                  uint32_t *offset_in_block) {
     if (start_block == FAT_FREE || start_block == FAT_EOC)
         return -1;
+
     uint32_t block_count = file_offset / g_block_size;
     *offset_in_block = file_offset % g_block_size;
     uint16_t current = start_block;
     for (uint32_t i = 0; i < block_count; i++) {
         if (current == FAT_EOC)
             return -1;
+
         current = g_fat[current];
     }
+
     *block_out = current;
     return 0;
 }
 
-/* allocate_free_block: Finds a free block in the FAT and marks it as allocated */
+/*
+ * allocate_free_block: Scans the FAT (from data_start_block onward) to find a free block,
+ * marks it as allocated (FAT_EOC), and returns its index. Returns -1 if no free block.
+ */
 static int allocate_free_block(void) {
     uint32_t total_entries = (g_superblock.fat_block_count * g_block_size) / sizeof(uint16_t);
     for (uint32_t i = g_superblock.data_start_block; i < total_entries; i++) {
@@ -182,12 +172,92 @@ static int allocate_free_block(void) {
     return -1;
 }
 
+/* 
+ * lookup_entry:
+ *   Searches the global directory (g_root_dir) for an entry with a matching file name.
+ *   If not found and create==true, it creates a new entry.
+ * Returns the directory index on success or a negative PennFatErr code on failure.
+ */
+ static int lookup_entry(const char *fname, int mode) {
+    if (!fname || fname[0] == '\0') {
+        LOG_ERR("[lookup_entry] Invalid filename.");
+        return PennFatErr_INVAD;
+    }
+
+    if (!g_mounted) {
+        LOG_WARN("[lookup_entry] Failed to lookup file '%s': Filesystem not mounted.", fname);
+        return PennFatErr_NOT_MOUNTED;
+    }
+
+    /* Compute the actual number of directory entries available in the allocated block:
+       Since g_root_dir points to one block, 
+         num_entries = g_block_size / sizeof(dir_entry_t)
+    */
+    uint32_t num_entries = g_block_size / sizeof(dir_entry_t);
+    
+    int free_idx = -1;
+    for (int i = 0; i < num_entries; i++) {
+        if (g_root_dir[i].name[0] == '\0') {
+            if (free_idx < 0) {
+                LOG_DEBUG("[lookup_entry] Found free directory entry at index %d for file '%s'.", i, fname);
+                free_idx = i;
+            }
+        } else if (strncmp(g_root_dir[i].name, fname, sizeof(g_root_dir[i].name)) == 0) {
+            LOG_DEBUG("[lookup_entry] Found existing file entry at index %d for file '%s'.", i, fname);
+
+            /* Found a matching entry.
+               Now check permission based on op_mode:
+                 - If op_mode == F_READ: require PERM_READ.
+                 - If op_mode == F_WRITE or F_APPEND: require PERM_WRITE.
+            */
+            if ((REQ_READ_PERM(mode) && !CAN_READ(g_root_dir[i].perm)) ||
+                (REQ_WRITE_PERM(mode) && !CAN_WRITE(g_root_dir[i].perm))) {
+                LOG_ERR("[lookup_entry] Permission denied for file '%s'.", fname);
+                return PennFatErr_PERM;
+            }
+            return i;  // Found the file entry
+        }
+    }
+    
+    if (!HAS_CREATE(mode)) {
+        LOG_INFO("[lookup_entry] Failed to lookup file '%s': File does not exist.", fname);
+        return PennFatErr_EXISTS;  // Not found and not allowed to create
+    }
+
+    if (free_idx < 0) {
+        LOG_ERR("[lookup_entry] Failed to lookup file '%s': No free directory entries available for new file.", fname);
+        return PennFatErr_OUTOFMEM;  // No free directory entries available
+    }
+    
+    /* Create a new directory entry */
+    int idx = free_idx;
+    memset(&g_root_dir[idx], 0, sizeof(dir_entry_t));
+    strncpy(g_root_dir[idx].name, fname, sizeof(g_root_dir[idx].name) - 1);
+    g_root_dir[idx].size = 0;
+    g_root_dir[idx].mtime = time(NULL);
+    g_root_dir[idx].perm = DEF_PERM;  // Default permissions
+    
+    /* Allocate first block for the new file */
+    int block = allocate_free_block();
+    if (block < 0) {
+        LOG_ERR("[lookup_entry] Failed to allocate a new block for file '%s': No free blocks available.", fname);
+        memset(&g_root_dir[idx], 0, sizeof(dir_entry_t));  // Clear the entry
+        return PennFatErr_NOSPACE;  // No free blocks available
+    }
+    g_root_dir[idx].first_block = (uint16_t)block;
+
+    LOG_DEBUG("[lookup_entry] Created new file entry for '%s' at index %d with starting block %u.", 
+              fname, idx, g_root_dir[idx].first_block);
+
+    return idx;
+}
+
 
 // ---------------------------------------------------------------------------
 // 3) SYSTEM-WIDE FILE TABLE (SWFT) HELPERS
 // ---------------------------------------------------------------------------
 
-/* create_sysfile_entry: Create a new system file entry for a directory index */
+/* create_sysfile_entry: Creates a new system file table entry for directory index 'dir_index' */
 static int create_sysfile_entry(int dir_index) {
     for (int i = 0; i < MAX_SYSTEM_FILES; i++) {
         if (!g_sysfile_table[i].in_use) {
@@ -197,6 +267,10 @@ static int create_sysfile_entry(int dir_index) {
             g_sysfile_table[i].first_block = g_root_dir[dir_index].first_block;
             g_sysfile_table[i].size = g_root_dir[dir_index].size;
             g_sysfile_table[i].mtime = g_root_dir[dir_index].mtime;
+
+            LOG_DEBUG("[create_sysfile_entry] Created new system file entry at index %d for directory index %d.", 
+                      i, dir_index);
+
             return i;
         }
     }
@@ -208,6 +282,10 @@ static int find_and_increment_sysfile(int dir_index) {
     for (int i = 0; i < MAX_SYSTEM_FILES; i++) {
         if (g_sysfile_table[i].in_use && g_sysfile_table[i].dir_index == dir_index) {
             g_sysfile_table[i].ref_count++;
+
+            LOG_DEBUG("[find_and_increment_sysfile] Found existing system file entry at index %d for directory index %d with ref count %d.", 
+                      i, dir_index, g_sysfile_table[i].ref_count);
+
             return i;
         }
     }
@@ -228,6 +306,9 @@ static void release_sysfile_entry(int sys_idx) {
         g_root_dir[d_idx].mtime = g_sysfile_table[sys_idx].mtime;
         g_root_dir[d_idx].first_block = g_sysfile_table[sys_idx].first_block;
         memset(&g_sysfile_table[sys_idx], 0, sizeof(system_file_t));
+
+        LOG_DEBUG("[release_sysfile_entry] Released system file entry at index %d for directory index %d.", 
+                  sys_idx, d_idx);
     }
 }
 
@@ -254,76 +335,50 @@ PennFatErr k_open(const char *fname, int mode) {
         LOG_WARN("[k_open] Failed to open file '%s': Filesystem not mounted.", fname);
         return PennFatErr_NOT_MOUNTED; 
     }
-
-    int found_idx = -1, free_idx = -1;
-    for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
-        if (g_root_dir[i].name[0] == '\0') {
-            if (free_idx < 0) {
-                free_idx = i;
-                LOG_DEBUG("[k_open] Found free directory entry at index %d for file '%s'.", i, fname);
-            }
-                
-        } else if (strncmp(g_root_dir[i].name, fname, sizeof(g_root_dir[i].name)) == 0) {
-            found_idx = i;
-            LOG_DEBUG("[k_open] Found existing file entry at index %d for file '%s'.", i, fname);
-            break;
-        }
+    if (!fname || fname[0] == '\0') {
+        LOG_ERR("[k_open] Failed to open file: Invalid filename.");
+        return PennFatErr_INVAD;
+    }
+    if (!is_valid_mode(mode)) {
+        LOG_ERR("[k_open] Failed to open file '%s': Invalid mode %d.", fname, mode);
+        return PennFatErr_INVAD;
     }
 
-    if (found_idx < 0) {
-        if (mode == F_READ) {
-            LOG_INFO("[k_open] Failed to open file '%s': File does not exist.", fname);
-            return PennFatErr_EXISTS;
-        }
-        if (free_idx < 0) {
-            LOG_ERR("[k_open] Failed to open file '%s': No free directory entries available for new file.", fname);
-            return PennFatErr_OUTOFMEM;
-        }
+    /* For open, if mode is F_READ we require the file to exist;
+     * for F_WRITE/F_APPEND, if not found, we create it.
+     */
+    int dir_idx = lookup_entry(fname, mode);
+    if (dir_idx < 0)
+        return dir_idx;  // Propagate error code
 
-        found_idx = free_idx;
-        memset(&g_root_dir[found_idx], 0, sizeof(dir_entry_t));
-        strncpy(g_root_dir[found_idx].name, fname, sizeof(g_root_dir[found_idx].name) - 1);
-        g_root_dir[found_idx].name[sizeof(g_root_dir[found_idx].name) - 1] = '\0';
-        g_root_dir[found_idx].size = 0;
-        g_root_dir[found_idx].mtime = time(NULL);
-        int new_blk = allocate_free_block();
-
-        if (new_blk < 0) {
-            LOG_ERR("[k_open] Failed to allocate a new block for file '%s': No free blocks available.", fname);
-            return PennFatErr_NOSPACE;  // No free blocks available to allocate for the new file
+    /* For an existing file opened in F_WRITE, we perform truncation.
+     * (This logic may be extended as needed.)
+     */
+    if (HAS_WRITE(mode)) {
+        uint16_t first = g_root_dir[dir_idx].first_block;
+        uint16_t next = g_fat[first];
+        g_fat[first] = FAT_EOC;
+        while (next != FAT_EOC) {
+            uint16_t temp = g_fat[next];
+            g_fat[next] = FAT_FREE;
+            next = temp;
         }
+        g_root_dir[dir_idx].size = 0;
+        g_root_dir[dir_idx].mtime = time(NULL);
 
-        g_root_dir[found_idx].first_block = new_blk;
-        LOG_DEBUG("[k_open] Created new file entry for '%s' at index %d with starting block %u.", 
-                  fname, found_idx, g_root_dir[found_idx].first_block);
-    } else {
-        if (mode == F_WRITE) {
-            /* Truncate file: free all blocks after the first */
-            uint16_t first = g_root_dir[found_idx].first_block;
-            uint16_t next = g_fat[first];
-            g_fat[first] = FAT_EOC;
-            while (next != FAT_EOC) {
-                uint16_t temp = g_fat[next];
-                g_fat[next] = FAT_FREE;
-                next = temp;
-            }
-            g_root_dir[found_idx].size = 0;
-            g_root_dir[found_idx].mtime = time(NULL);
-
-            LOG_DEBUG("[k_open] Truncated file '%s' at index %d, cleared all blocks after the first.", 
-                      fname, found_idx);
-        }
+        LOG_DEBUG("[k_open] Truncated file '%s' at directory index %d.", fname, dir_idx);
     }
 
-    int sys_idx = find_and_increment_sysfile(found_idx);
+    /* Set up system-wide file table entry:
+     * Try to find an existing system file entry; if not found, create one.
+     */
+    int sys_idx = find_and_increment_sysfile(dir_idx);
     if (sys_idx < 0) {
-        sys_idx = create_sysfile_entry(found_idx);
-        if (sys_idx < 0) {
-            LOG_ERR("[k_open] Failed to create a new system file entry for file '%s': No more system file slots available.", 
-                    fname);
-            return PennFatErr_OUTOFMEM; /* Failed to create a new system file entry */
-        }
+        sys_idx = create_sysfile_entry(dir_idx);
+        if (sys_idx < 0)
+            return PennFatErr_OUTOFMEM;  // No free system file entries available
     }
+
     LOG_DEBUG("[k_open] Successfully found or created system file entry at index %d for file '%s'.", 
               sys_idx, fname);
 
@@ -332,7 +387,7 @@ PennFatErr k_open(const char *fname, int mode) {
             g_fd_table[fd].in_use = true;
             g_fd_table[fd].sysfile_index = sys_idx;
             g_fd_table[fd].mode = mode;
-            g_fd_table[fd].offset = (mode == F_APPEND) ? g_sysfile_table[sys_idx].size : 0;
+            g_fd_table[fd].offset = HAS_APPEND(mode) ? g_sysfile_table[sys_idx].size : 0;
 
             LOG_INFO("[k_open] Assigned file descriptor %d for file '%s'",
                      fd, fname);
@@ -343,10 +398,8 @@ PennFatErr k_open(const char *fname, int mode) {
         }
     }
 
+    LOG_ERR("[k_open] Failed to open file '%s': No free file descriptors available.", fname);
     release_sysfile_entry(sys_idx);
-    LOG_ERR("[k_open] Failed to find a free file descriptor for file '%s': Maximum number of open file descriptors reached (%d).",
-          fname, MAX_FD);
-
     return PennFatErr_OUTOFMEM;
 }
 
@@ -372,7 +425,7 @@ PennFatErr k_read(int fd, int n, char *buf) {
     LOG_DEBUG("[k_read] Attempting to read from file descriptor %d (sysfile index %d, offset %u, size %u).",
               fd, sys_idx, fdesc->offset, sf->size);
 
-    if (fdesc->mode == F_WRITE) {
+    if (HAS_WRITE(fdesc->mode)) {
         LOG_WARN("[k_read] Cannot read from file descriptor %d: File opened in write-only mode.", fd);
         return PennFatErr_PERM;
     }
@@ -442,7 +495,7 @@ PennFatErr k_write(int fd, const char *buf, int n) {
     LOG_DEBUG("[k_write] Attempting to write to file descriptor %d (sysfile index %d, offset %u).",
               fd, sys_idx, fdesc->offset);
 
-    if (fdesc->mode == F_READ) {
+    if (HAS_READ(fdesc->mode)) {
         LOG_WARN("[k_write] Cannot write to file descriptor %d: File opened in read-only mode.", fd);
         return PennFatErr_PERM; /* Cannot write in read-only mode */
     }
@@ -512,14 +565,13 @@ PennFatErr k_close(int fd) {
         return PennFatErr_INTERNAL;
     }
 
-    fd_entry_t *fdesc = &g_fd_table[fd];
-    int sys_idx = fdesc->sysfile_index;
-    fdesc->in_use = false;
+    int sys_idx = g_fd_table[fd].sysfile_index;
+    g_fd_table[fd].in_use = false;
     release_sysfile_entry(sys_idx);
 
     LOG_INFO("[k_close] Successfully closed file descriptor %d (sysfile index %d).", fd, sys_idx);
 
-    return 0;
+    return PennFatErr_SUCCESS;
 }
 
 /** 
@@ -534,37 +586,33 @@ PennFatErr k_unlink(const char *fname) {
         LOG_WARN("[k_unlink] Failed to unlink file '%s': Filesystem not mounted.", fname);
         return PennFatErr_NOT_MOUNTED; 
     }
-
-    int dir_index = -1;
-    for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
-        if (strncmp(g_root_dir[i].name, fname, sizeof(g_root_dir[i].name)) == 0) {
-            dir_index = i;
-            break;
-        }
+    if (!fname || fname[0] == '\0') {
+        LOG_ERR("[k_unlink] Failed to unlink file: Invalid filename.");
+        return PennFatErr_INVAD;
     }
 
-    if (dir_index < 0) {
-        LOG_ERR("[k_unlink] Failed to unlink file '%s': File does not exist.", fname);
-        return PennFatErr_EXISTS; /* File not found */
-    }
+    int dir_idx = lookup_entry(fname, K_O_CREATE);
+    if (dir_idx < 0)
+        return PennFatErr_EXISTS;   // File not found
 
+    LOG_DEBUG("[k_unlink] Attempting to unlink file '%s' at directory index %d.", fname, dir_idx);
+
+     /* Ensure the file is not in use via the system-wide file table */
     for (int i = 0; i < MAX_SYSTEM_FILES; i++) {
-        if (g_sysfile_table[i].in_use && g_sysfile_table[i].dir_index == dir_index) {
-            LOG_WARN("[k_unlink] Failed to unlink file '%s': File is currently in use by another process (sysfile index %d).",
-                     fname, i);
-            return PennFatErr_INUSE;
-        }
+        if (g_sysfile_table[i].in_use && g_sysfile_table[i].dir_index == dir_idx)
+            return PennFatErr_INUSE;  // File is currently open
     }
 
-    uint16_t cur = g_root_dir[dir_index].first_block;
+    /* Free the FAT chain for this file */
+    uint16_t cur = g_root_dir[dir_idx].first_block;
     while (cur != FAT_EOC) {
         uint16_t nxt = g_fat[cur];
         g_fat[cur] = FAT_FREE;
         cur = nxt;
     }
-    memset(&g_root_dir[dir_index], 0, sizeof(dir_entry_t));
+    memset(&g_root_dir[dir_idx], 0, sizeof(dir_entry_t));
 
-    LOG_INFO("[k_unlink] Successfully unlinked file '%s' from directory entry %d.", fname, dir_index);
+    LOG_INFO("[k_unlink] Successfully unlinked file '%s' from directory entry %d.", fname, dir_idx);
     return 0;
 }
 
@@ -628,42 +676,169 @@ PennFatErr k_lseek(int fd, int offset, int whence) {
  * the time being, chmod will be required to be implemented later), size, latest
  * modification timestamp and filename.
  */
-PennFatErr k_ls(const char *fname) {
+PennFatErr k_ls(void) {
     if (!g_mounted) {
         LOG_WARN("[k_ls] Failed to list files: Filesystem not mounted.");
         return PennFatErr_NOT_MOUNTED; 
     }
 
     /* Buffer to hold formatted time */
+    char perm_str[4];
     char time_buf[20];
     struct tm *tm_info;
+    uint32_t num_entries = g_block_size / sizeof(dir_entry_t);
 
-    if (fname && fname[0] != '\0') {
-        for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
-            if (strncmp(g_root_dir[i].name, fname, sizeof(g_root_dir[i].name)) == 0) {
-                tm_info = localtime(&g_root_dir[i].mtime);
-                strftime(time_buf, sizeof(time_buf), "%b %d %H:%M", tm_info);
 
-                // TODO: [Permissions] using a placeholder "rw-" for now
-                printf("%5u  %-4s  %10u  %s  %s\n", 
-                       g_root_dir[i].first_block, "rw-", g_root_dir[i].size, time_buf, g_root_dir[i].name);
-                return 0;
-            }
+    for (int i = 0; i < num_entries; i++) {
+        if (g_root_dir[i].name[0] != '\0') {
+            tm_info = localtime(&g_root_dir[i].mtime);
+            strftime(time_buf, sizeof(time_buf), "%b %d %H:%M", tm_info);
+            perm_to_str(g_root_dir[i].perm, perm_str);
+            printf("%5u  %-4s  %8u  %s  %s\n", 
+                    g_root_dir[i].first_block, perm_str, g_root_dir[i].size, time_buf, g_root_dir[i].name);
         }
-
-        LOG_WARN("[k_ls] Failed to list file '%s': File not found in the directory.", fname);
-        return PennFatErr_EXISTS;
-    } else {
-        for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
-            if (g_root_dir[i].name[0] != '\0') {
-                tm_info = localtime(&g_root_dir[i].mtime);
-                strftime(time_buf, sizeof(time_buf), "%b %d %H:%M", tm_info);
-                printf("%5u  %-4s  %10u  %s  %s\n", 
-                       g_root_dir[i].first_block, "rw-", g_root_dir[i].size, time_buf, g_root_dir[i].name);
-            }
-        }
-        return 0;
     }
+    return PennFatErr_SUCCESS;
+
+}
+
+/*
+ * k_touch: A kernel-level "touch" operation.
+ *
+ * Behavior:
+ *   - If a file with fname exists, update its mtime to the current time.
+ *   - Otherwise, create a new file entry with 0 size and the current mtime.
+ *
+ * Returns:
+ *   0 on success, or a negative error code.
+ *
+ * This function leverages lookup_entry() with create=true.
+ */
+ PennFatErr k_touch(const char *fname) {
+    if (!g_mounted)
+        return PennFatErr_NOT_MOUNTED;
+    
+    int idx = lookup_entry(fname, K_O_CREATE);
+    if (idx < 0)
+        return idx;  // Propagate error
+    
+    // If file already existed, simply update its modification time.
+    g_root_dir[idx].mtime = time(NULL);
+    
+    return PennFatErr_SUCCESS;
+}
+
+/*
+ * k_rename:
+ *   Renames a file from oldname to newname.
+ *
+ * Parameters:
+ *   oldname: the current file name.
+ *   newname: the new file name to assign.
+ *
+ * Returns:
+ *   PennFatErr_SUCCESS (0) on success, or a negative error code.
+ *
+ * Behavior:
+ *   - If the filesystem is not mounted, returns PENNFAT_ERR_NOT_MOUNTED.
+ *   - If either parameter is NULL or empty, returns PENNFAT_ERR_PARAM.
+ *   - If no directory entry is found with oldname, returns PENNFAT_ERR_PARAM.
+ *   - If a directory entry already exists with newname, returns PENNFAT_ERR_PARAM.
+ *   - Otherwise, updates the directory entry for oldname to hold newname and updates mtime.
+ */
+PennFatErr k_rename(const char *oldname, const char *newname) {
+    if (!g_mounted) {
+        LOG_WARN("[k_rename] Filesystem not mounted.");
+        return PennFatErr_NOT_MOUNTED;
+    }
+    if (!oldname || oldname[0] == '\0' || !newname || newname[0] == '\0') {
+        LOG_ERR("[k_rename] Invalid parameters: both oldname and newname must be non-empty.");
+        return PennFatErr_INVAD;
+    }
+
+    /* Compute number of directory entries in the allocated root directory block. */
+    uint32_t num_entries = g_block_size / sizeof(dir_entry_t);
+    int old_idx = -1;
+    int new_idx = -1;
+
+    for (uint32_t i = 0; i < num_entries; i++) {
+        /* If we find an entry with a matching oldname, record its index. */
+        if (g_root_dir[i].name[0] != '\0' &&
+            strncmp(g_root_dir[i].name, oldname, sizeof(g_root_dir[i].name)) == 0) {
+            old_idx = i;
+        }
+        /* Also check if newname already exists in a non-empty entry. */
+        if (g_root_dir[i].name[0] != '\0' &&
+            strncmp(g_root_dir[i].name, newname, sizeof(g_root_dir[i].name)) == 0) {
+            new_idx = i;
+            break;
+        }
+    }
+
+    if (old_idx < 0) {
+        LOG_ERR("[k_rename] File '%s' not found.", oldname);
+        return PennFatErr_EXISTS;
+    }
+    if (new_idx >= 0) {
+        LOG_ERR("[k_rename] New filename '%s' already exists.", newname);
+        return PennFatErr_INVAD;
+    }
+
+    /* Update the directory entry for old_idx to have the new name */
+    memset(g_root_dir[old_idx].name, 0, sizeof(g_root_dir[old_idx].name));
+    strncpy(g_root_dir[old_idx].name, newname, sizeof(g_root_dir[old_idx].name) - 1);
+    g_root_dir[old_idx].mtime = time(NULL);
+
+    LOG_INFO("[k_rename] Renamed file '%s' to '%s' in directory entry %d.", 
+             oldname, newname, old_idx);
+
+    /* Optionally, if the file is currently open, you might update the corresponding system-wide
+       file table entry as well. In our design the system-wide file table stores only the directory 
+       index, file size, first block, and mtime. Since mtime is updated in the directory (and optionally 
+       could be propagated to the system-wide file table), additional action might not be necessary.
+    */
+
+    return PennFatErr_SUCCESS;
+}
+
+/*
+ * k_chmod: Changes the permission of the file with name fname to new_perm.
+ * Allowed new_perm values: 0, 2, 4, 5, 6, or 7.
+ * Returns PennFatErr_SUCCESS on success or a negative error code.
+ */
+PennFatErr k_chmod(const char *fname, uint8_t new_perm) {
+    if (!g_mounted) {
+        LOG_WARN("[k_chmod] Filesystem not mounted.");
+        return PennFatErr_NOT_MOUNTED;
+    }
+    if (!fname || fname[0] == '\0') {
+        LOG_WARN("[k_chmod] Invalid filename.");
+        return PennFatErr_INVAD;
+    }
+    if (!VALID_PERM(new_perm)) {
+        LOG_WARN("[k_chmod] Invalid permission value: %u", new_perm);
+        return PennFatErr_INVAD;
+    }
+    
+    int dir_idx = lookup_entry(fname, K_O_RDONLY);
+    if (dir_idx < 0) {
+        LOG_WARN("[k_chmod] File '%s' not found.", fname);
+        return PennFatErr_EXISTS;
+    }
+    
+    g_root_dir[dir_idx].perm = new_perm;
+    g_root_dir[dir_idx].mtime = time(NULL);
+    LOG_INFO("[k_chmod] Changed permissions of file '%s' to %u.", fname, new_perm);
+    
+    /* Optionally update system-wide file table if the file is open */
+    for (int i = 0; i < MAX_SYSTEM_FILES; i++) {
+        if (g_sysfile_table[i].in_use && g_sysfile_table[i].dir_index == dir_idx) {
+            g_sysfile_table[i].mtime = g_root_dir[dir_idx].mtime;
+            /* If desired, store permission in system-wide entry as well */
+        }
+    }
+    
+    return PennFatErr_SUCCESS;
 }
 
 /* --- Mount/Unmount Functions --- */
@@ -745,7 +920,15 @@ PennFatErr k_mount(const char *fs_name) {
         return PennFatErr_INTERNAL;
     }
 
-     /* Read the root directory region.
+    /* Set up the superblock info from FAT[0]:
+       - g_superblock.fat_block_count is set from fat_blocks.
+       - Data blocks start at index 2: index 0 holds formatting info and index 1 is reserved for the root directory.
+    */
+    g_superblock.fat_block_count = fat_blocks;
+    g_superblock.data_start_block = 2;
+
+
+    /* Read the root directory region.
        According to our mkfs, the root directory is stored in the first data block,
        which immediately follows the FAT region. Its size is one block (g_block_size bytes).
        Compute the offset for the root directory:

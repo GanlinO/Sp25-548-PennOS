@@ -6,16 +6,6 @@
 
 #include "../common/pennfat_errors.h"
 
-/* File Modes */
-#define F_READ    1
-#define F_WRITE   2
-#define F_APPEND  3
-
-/* lseek Whence Constants */
-#define F_SEEK_SET 0
-#define F_SEEK_CUR 1
-#define F_SEEK_END 2
-
 /* Initialization function: call this from your main application */
 void pennfat_kernel_init(void);
 
@@ -29,7 +19,10 @@ PennFatErr k_read(int fd, int n, char *buf);
 PennFatErr k_write(int fd, const char *buf, int n);
 PennFatErr k_unlink(const char *fname);
 PennFatErr k_lseek(int fd, int offset, int whence);
-PennFatErr k_ls(const char *fname);
+PennFatErr k_ls(void);
+PennFatErr k_touch(const char *fname);
+PennFatErr k_rename(const char *oldname, const char *newname);
+PennFatErr k_chmod(const char *fname, uint8_t perm);
 
 /* Mount/Unmount */
 PennFatErr k_mount(const char *fs_name);

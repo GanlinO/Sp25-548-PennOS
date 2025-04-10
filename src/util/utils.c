@@ -6,11 +6,11 @@ void prompt(const char *prompt) {
     fflush(stdout);
 }
 
-void get_cmd(char *buf, size_t size) {
+int get_cmd(char *buf, size_t size) {
     if (fgets(buf, size, stdin) == NULL) {
-        perror("fgets");
-        exit(EXIT_FAILURE);
+        return -1;
     }
+    return 0;
 }
 
 int safe_parse_command(const char* line, command_t** cmd) {

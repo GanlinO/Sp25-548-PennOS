@@ -27,7 +27,8 @@ void prompt(const char* prompt);
  * Read a command line from the standard input.
  * @param buf The buffer to store the command line.
  * @param size The size of the buffer.
+ * @return 0 on success, -1 on error/EOF
  */
-void get_cmd(char* buf, size_t size);
+int get_cmd(char* buf, size_t size);
 
 #endif // UTILS_H
