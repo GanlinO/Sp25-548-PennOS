@@ -5,17 +5,22 @@
 #include "../util/utils.h"    // for assert_non_null
 
 #include <stdlib.h>
+#include <signal.h>           // for scheduler handling SIGALRM
 
 /********************
  *    definitions   *
  ********************/
 
-#define MAX_PID_NUMBER 65535   // largest possible PID #
-#define INIT_PID 1
+#define MAX_PID_NUMBER (65535)   // largest possible PID #
+#define INIT_PID (1)
 
-#define PRIORITY_1_WEIGHT 9
-#define PRIORITY_2_WEIGHT 6
-#define PRIORITY_3_WEIGHT 4
+#define PRIORITY_1_WEIGHT (9)   // 1.5x than PRIORITY_2_WEIGHT
+#define PRIORITY_2_WEIGHT (6)   // 1.5x than PRIORITY_3_WEIGHT
+#define PRIORITY_3_WEIGHT (4)
+
+#define MILLISECOND_IN_USEC (1000)
+#define SECOND_IN_USEC (1000000)
+#define CLOCK_TICK_IN_USEC (500 * MILLISECOND_IN_USEC)
 
 #define PROCESS_CONTROL_MODULE_NAME "PROCESS_CONTROL"
 
@@ -68,6 +73,11 @@ typedef struct routine_exit_wrapper_args_t {
  * static variables *
  ********************/
 
+// the flag to indicate that the scheduler should be shut down
+bool shutdown;
+// the mutex to protect shutdown
+pthread_mutex_t shutdown_mtx;
+
 // the pid handed out most recently
 static pid_t last_pid;
 
@@ -101,9 +111,8 @@ static Logger* logger = NULL;
 static void process_control_initialize();
 static void create_init();
 static void* init_routine(void* arg);
-// static void process_control_cleanup();
+static void process_control_cleanup();
 
-// static void expand_all_prcs_vec_capacity();
 static pcb_t* get_pcb_at_pid(pid_t pid);
 static void set_pcb_at_pid(pid_t pid, pcb_t* pcb_ptr);
 static pid_t get_new_pid();
@@ -115,6 +124,16 @@ static routine_exit_wrapper_args_t* wrap_routine_exit_args(void* (*func)(void*),
 static void set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), char* argv[], bool wrap_exit);
 
 static void spthread_cancel_and_join(spthread_t thread);
+
+/********************
+ * POSIX signal handler *
+ ********************/
+
+/**
+ * SIGALRM handler to override default behavior
+ * intentionally left empty 
+ */
+static void alarm_handler(int signum) {}
 
 /********************
  * internal functions *
@@ -129,6 +148,9 @@ static void process_control_initialize() {
   if (initialized) {
     return;
   }
+
+  assert_non_negative(pthread_mutex_init(&shutdown_mtx, NULL), 
+    "Error init mutex in process_control_initialize");
 
   last_pid = 0;
 
@@ -190,7 +212,7 @@ static void* init_routine(void* arg) {
  * Clean up the process control module metadata upon graceful shutdown
  */
 // static void process_control_cleanup() {
-void process_control_cleanup() {
+static void process_control_cleanup() {
   logger_log(logger, LOG_LEVEL_DEBUG, "process_control_cleanup started");
 
   // TODO: cancel all the unfinished processes
@@ -213,6 +235,9 @@ void process_control_cleanup() {
 
   vec_destroy(&all_prcs);
 
+  assert_non_negative(pthread_mutex_destroy(&shutdown_mtx), 
+    "Error init mutex in process_control_initialize");
+
   logger_log(logger, LOG_LEVEL_DEBUG, "process_control_cleanup completed");
 
   logger_close(logger);  
@@ -222,29 +247,6 @@ void process_control_cleanup() {
 /********************
  * helper functions *
  ********************/
-
-/**
- * Double the size of all_prcs (capped by MAX_PID_NUMBER)
- */
-// static void expand_all_prcs_vec_capacity() {
-//   size_t all_prcs_capacity = vec_capacity(&all_prcs);
-//   if (all_prcs_capacity >= MAX_PID_NUMBER) {
-//     return;
-//   }
-
-//   if (all_prcs_capacity == 0) {
-//     all_prcs_capacity = 2;
-//   } else if (all_prcs_capacity > MAX_PID_NUMBER / 2) {
-//     all_prcs_capacity = MAX_PID_NUMBER;
-//   } else {
-//     all_prcs_capacity *= 2;
-//   }
-
-//   if (all_prcs_capacity > vec_capacity(&all_prcs)) {
-//     vec_resize_and_clean(&all_prcs, all_prcs_capacity);
-//     logger_log(logger, LOG_LEVEL_ERROR, "all_prcs size set to%zu", all_prcs_capacity);
-//   }
-// }
 
 /**
  * Get the PCB pointer for a certain PID.
@@ -401,7 +403,7 @@ static pcb_t* spthread_to_pcb (spthread_t spthread) {
     }
   }
 
-  logger_log(logger, LOG_LEVEL_ERROR, "Not able to find spthread in spthread_to_pid");
+  logger_log(logger, LOG_LEVEL_ERROR, "Not able to find spthread in spthread_to_pcb");
   return NULL;
 }
 
@@ -480,9 +482,130 @@ static void spthread_cancel_and_join(spthread_t thread) {
   spthread_join(thread, NULL);
 }
 
+/**
+ * Helper function to get the next priority level for scheduling based on priority weighting
+ */
+static schedule_priority scheduler_get_next_priority() {
+  static const int weight[PRIORITY_COUNT] = {PRIORITY_1_WEIGHT, PRIORITY_2_WEIGHT, PRIORITY_3_WEIGHT};
+  static const int total_weight = PRIORITY_1_WEIGHT + PRIORITY_2_WEIGHT + PRIORITY_3_WEIGHT;
+  static int ticket[PRIORITY_COUNT] = {0};
+
+  #ifdef SCHEDULER_COUNTER_ON
+  static int overall = 0;
+  static int real_cnt[3] = {0};
+  ++overall;
+  #endif
+
+  schedule_priority next = PRIORITY_1;
+  ticket[PRIORITY_1] += weight[PRIORITY_1];
+  int max_ticket = weight[PRIORITY_1];
+
+  for (schedule_priority i = PRIORITY_2; i < PRIORITY_COUNT; ++i) {
+    ticket[i] += weight[i];
+
+    if (ticket[i] > max_ticket) {
+      max_ticket = ticket[i];
+      next = i;
+    }
+  }
+
+  // the one currently with max ticket will be the next priority
+  ticket[next] -= total_weight;
+
+  #ifdef SCHEDULER_COUNTER_ON
+  ++real_cnt[next];
+  fprintf(stderr, "[%d]\t%d\t%3d %3d %3d\t%3d %3d %3d\t%0.2f %0.2f\n", 
+    overall, next, ticket[0], ticket[1], ticket[2],
+    real_cnt[0], real_cnt[1], real_cnt[2],
+    (double) real_cnt[0] / real_cnt[1], (double) real_cnt[1] / real_cnt[2]
+  );
+  #endif
+
+  return next;
+}
+
 /********************
  * public functions *
  ********************/
+
+ void k_scheduler() {
+  // the scheduler should not be called another time
+  static bool scheduler_started = false;
+  if (scheduler_started) {
+    return;
+  }
+  scheduler_started = true;
+
+  logger_log(logger, LOG_LEVEL_DEBUG, "start k_scheduler");
+  create_init();
+
+  // mask for while scheduler is waiting for alarm to go off
+  // block all other signals
+  sigset_t suspend_set;
+  sigfillset(&suspend_set);
+  sigdelset(&suspend_set, SIGALRM);
+
+  // register an empty handler so that default disposition is overridden
+  struct sigaction act = (struct sigaction){
+      .sa_handler = alarm_handler,
+      .sa_mask = suspend_set,
+      .sa_flags = SA_RESTART,
+  };
+  sigaction(SIGALRM, &act, NULL);
+
+  // make sure SIGALRM is unblocked
+  sigset_t alarm_set;
+  sigemptyset(&alarm_set);
+  sigaddset(&alarm_set, SIGALRM);
+  pthread_sigmask(SIG_UNBLOCK, &alarm_set, NULL);
+
+  struct itimerval it;
+  it.it_interval = (struct timeval){
+    .tv_sec = CLOCK_TICK_IN_USEC / SECOND_IN_USEC,
+    .tv_usec = CLOCK_TICK_IN_USEC % SECOND_IN_USEC
+  };
+  it.it_value = it.it_interval;
+  setitimer(ITIMER_REAL, &it, NULL);
+
+  schedule_priority next_priority = scheduler_get_next_priority();
+
+  assert_non_negative(pthread_mutex_lock(&shutdown_mtx), "Mutex lock error in k_scheduler");
+  while (!shutdown) {
+    assert_non_negative(pthread_mutex_unlock(&shutdown_mtx), "Mutex unlock error in k_scheduler");
+    if (vec_len(&ready_prcs_queues[next_priority]) != 0) {
+      // picked ready queue is not empty
+      pcb_t* pcb_next_run = (pcb_t*) vec_get(&ready_prcs_queues[next_priority], 0);
+      vec_erase(&ready_prcs_queues[next_priority], 0);
+      if (!pcb_next_run) {
+        logger_log(logger, LOG_LEVEL_ERROR, "PCB null found in queue[%d] in k_scheduler", next_priority);
+        continue;
+      }
+
+      logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] (priority %d) picked to run by scheduler",
+        pcb_next_run->pid, next_priority);
+
+      spthread_continue(pcb_next_run->spthread);
+      sigsuspend(&suspend_set);
+      spthread_suspend(pcb_next_run->spthread);
+
+      if (pcb_next_run->state == PROCESS_STATE_READY) {
+        vec_push_back(&ready_prcs_queues[pcb_next_run->priority], pcb_next_run);
+      }
+    } else if (vec_len(&ready_prcs_queues[PRIORITY_1]) == 0 && vec_len(&ready_prcs_queues[PRIORITY_2]) == 0
+    && vec_len(&ready_prcs_queues[PRIORITY_3]) == 0) {
+      // all ready queue is empty
+      logger_log(logger, LOG_LEVEL_DEBUG, "All queue empty!", next_priority);
+      sigsuspend(&suspend_set);
+      continue;
+    } else {
+      logger_log(logger, LOG_LEVEL_DEBUG, "Queue[%d] empty so pass", next_priority);
+    }
+
+    next_priority = scheduler_get_next_priority();
+  }
+
+  process_control_cleanup();
+}
 
 pcb_t* k_proc_create(pcb_t* parent) {
   create_init();
@@ -501,6 +624,10 @@ pcb_t* k_proc_create(pcb_t* parent) {
 
     pcb_ptr = create_pcb(get_new_pid(), init_pcb_ptr);
   }
+
+  assert_non_null(pcb_ptr, "pcb_ptr null in k_proc_create");
+  set_pcb_at_pid(pcb_ptr->pid, pcb_ptr);
+  logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] PCB created and added to all_procs", pcb_ptr->pid);
   
   return pcb_ptr;
 }
@@ -511,26 +638,6 @@ void k_set_routine_and_run(pcb_t* proc, void* (*func)(void*), char* argv[]) {
 
 void k_proc_cleanup(pcb_t* proc) {
   // TODO
-}
-
-void k_scheduler() {
-  logger_log(logger, LOG_LEVEL_DEBUG, "start k_scheduler");
-  create_init();
-
-  
-  // TODO
-  spthread_continue(((pcb_t*) vec_get(&ready_prcs_queues[1], 0))->spthread);
-}
-
-void k_set_logger(Logger* new_logger) {
-  // check for null
-  if (new_logger) {
-    free(logger);
-    logger = new_logger;
-    logger_log(logger, LOG_LEVEL_DEBUG, "new logger set in k_set_logger");
-  } else {
-    logger_log(logger, LOG_LEVEL_ERROR, "Attempt to set logger to NULL in process control");
-  } 
 }
 
 void k_exit(void) {
@@ -550,4 +657,24 @@ void k_exit(void) {
   vec_push_back(&(parent_ptr->waitable_children), pcb_ptr);
 
   spthread_exit(NULL);
+}
+
+void k_shutdown(void) {
+  assert_non_negative(spthread_disable_interrupts_self(), "Error disable_interrupt in k_shutdown");
+  assert_non_negative(pthread_mutex_lock(&shutdown_mtx), "Mutex lock error in k_shutdown");
+  shutdown = true;
+  assert_non_negative(pthread_mutex_unlock(&shutdown_mtx), "Mutex unlock error in k_shutdown");
+  assert_non_negative(spthread_enable_interrupts_self(), "Error enable_interrupts in k_shutdown");
+}
+
+
+void k_set_logger(Logger* new_logger) {
+  // check for null
+  if (new_logger) {
+    free(logger);
+    logger = new_logger;
+    logger_log(logger, LOG_LEVEL_DEBUG, "new logger set in k_set_logger");
+  } else {
+    logger_log(logger, LOG_LEVEL_ERROR, "Attempt to set logger to NULL in process control");
+  } 
 }
