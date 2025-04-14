@@ -1,13 +1,15 @@
 #include "util/parser.h"
 
+#include <stdlib.h>
+
 // Feel free to modify or not use this document
 // this is just the skeleton of what stand alone pennfat
 // will probably look like for you
 
 // function declarations for special routines
-static void mkfs(const char *fs_name, int blocks_in_fat, int block_size_config);
-static int mount(const char *fs_name);
-static int unmount();
+[[maybe_unused]]static void mkfs(const char *fs_name, int blocks_in_fat, int block_size_config);
+[[maybe_unused]]static int mount(const char *fs_name);
+[[maybe_unused]]static int unmount();
 
 int main(int argc, char *argv[])
 {

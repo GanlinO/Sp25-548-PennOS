@@ -73,6 +73,11 @@ typedef struct {
  */
 Logger* logger_init(const char* name, LogLevel level);
 
+/**
+ * Initialize a logger that prints to stderr
+ */
+Logger* logger_init_stderr(LogLevel level, const char* name);
+
 /*
  * Logs a message with the specified log level.
  * Only messages at or above the logger's level are written.
