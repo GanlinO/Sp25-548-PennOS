@@ -1,5 +1,4 @@
 #include "process_control.h"
-#include "../common/pennos_types.h"  // for pid_t def
 #include "../util/spthread.h" // for spthread
 #include "../util/Vec.h"      // for Vec
 #include "../util/utils.h"    // for assert_non_null
@@ -11,8 +10,8 @@
  *    definitions   *
  ********************/
 
-#define MAX_PID_NUMBER (65535)   // largest possible PID #
-#define INIT_PID (1)
+#define MAX_PID_NUMBER (65535)  // largest possible PID #
+#define INIT_PID (1)            // PID # of INIT
 
 #define PRIORITY_1_WEIGHT (9)   // 1.5x than PRIORITY_2_WEIGHT
 #define PRIORITY_2_WEIGHT (6)   // 1.5x than PRIORITY_3_WEIGHT
@@ -20,7 +19,7 @@
 
 #define MILLISECOND_IN_USEC (1000)
 #define SECOND_IN_USEC (1000000)
-#define CLOCK_TICK_IN_USEC (500 * MILLISECOND_IN_USEC)
+#define CLOCK_TICK_IN_USEC (800 * MILLISECOND_IN_USEC)
 
 #define PROCESS_CONTROL_MODULE_NAME "PROCESS_CONTROL"
 
@@ -47,19 +46,26 @@ typedef enum process_state {
  * - priority level
  * - parent PCB pointer
  * - children PCB pointer
+ * - waitable children PCB pointer
+ * - PID of the child it is waiting for (or -1 for any); 0 for none
+ * - flag for whether it is being blocked for sleep()
+ * - the clock tick at which the process should be awake
+ * - own wstatus if the parent calls waitpid on it
  * - file descriptors
  * - pending signals
- * - waitable children
- * - return status ??
  */ 
 struct pcb_t {
   spthread_t spthread;
   pid_t pid;
   process_state state;
   schedule_priority priority;
-  pid_t parent;
+  pcb_t* parent;
   Vec children;
   Vec waitable_children;
+  pid_t waiting_child_pid;
+  bool blocked_by_sleep;
+  clock_tick_t wake_tick;
+  int waitpid_stat;
   Vec fds;
   signal_t pending_signals;
 };
@@ -78,27 +84,42 @@ bool shutdown;
 // the mutex to protect shutdown
 pthread_mutex_t shutdown_mtx;
 
+clock_tick_t clock_tick;
+
 // the pid handed out most recently
 static pid_t last_pid;
 
-// list of all processes (with index == PID - 1)
+// list of all processes (pcb_ptr*) with index exactly PID - 1
 // this can help get the PCB pointer of a certain PID
 // and also check whether a PID is available when giving out PIDs (with recycling)
+// Vec is expected to initialize with element destructor function (clean_up_pcb),
+// so when element is removed from Vec or when Vec is cleared/destructed, the 
+// corresponding PCB struct pointed by the pcb_ptr element will be cleaned up
 static Vec all_prcs;
 
-// queues of processes ready for scheduling (w/ different priorities)
+// queues of processes (pcb_ptr*) ready for scheduling (w/ different priorities)
+// used by scheduler to pick next process to run
+// Vec is expected to initialize without element destructor function
+// (removing the element does not trigger PCB clean up)
 static Vec ready_prcs_queues [PRIORITY_COUNT];
 
-// list of blocked process PIDs
+// list of blocked processes (pcb_ptr*)
+// used by the scheduler to examine blocked processes (whether they are ready
+// to be unblocked) during quantum gaps
+// may also contain stopped process if it is both stopped and blocked
+// Vec is expected to initialize without element destructor function
+// (removing the element does not trigger PCB clean up)
 static Vec blocked_prcs;
 
-// list of stopped processes
+// list of stopped processes (pcb_ptr*)
+// may also contain stopped process if it is both stopped and blocked
+// Vec is expected to initialize without element destructor function
+// (removing the element does not trigger PCB clean up)
 static Vec stopped_prcs;
 
-// list of zombie processes ??
-static Vec zombie_prcs;
-
 // list of processes with pending signals
+// Vec is expected to initialize without element destructor function
+// (removing the element does not trigger PCB clean up)
 static Vec pending_sig_prcs;
 
 // logger
@@ -112,16 +133,25 @@ static void process_control_initialize();
 static void create_init();
 static void* init_routine(void* arg);
 static void process_control_cleanup();
+static void examine_blocked_processes();
 
 static pcb_t* get_pcb_at_pid(pid_t pid);
 static void set_pcb_at_pid(pid_t pid, pcb_t* pcb_ptr);
 static pid_t get_new_pid();
 static pcb_t* create_pcb(pid_t pid, pcb_t* parent);
 static void clean_up_pcb(void* pcb_void_ptr);
-static pcb_t* spthread_to_pcb (spthread_t spthread);
+static pcb_t* get_pcb_by_spthread (spthread_t spthread);
+static void set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), char* argv[], bool wrap_exit);
+static bool check_blocked_waiting_child(pcb_t* pcb);
+
+static void init_adopt_children(pcb_t* pcb);
+static void register_blocked_state(pcb_t* pcb);
+
+static bool remove_pcb_first_from_vec(pcb_t* pcb_ptr, Vec* vec);
+static int remove_pcb_all_from_vec(pcb_t* pcb_ptr, Vec* vec);
+
 static void* routine_exit_wrapper_func(void* wrapped_args);
 static routine_exit_wrapper_args_t* wrap_routine_exit_args(void* (*func)(void*), char* argv[]);
-static void set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), char* argv[], bool wrap_exit);
 
 static void spthread_cancel_and_join(spthread_t thread);
 
@@ -152,6 +182,7 @@ static void process_control_initialize() {
   assert_non_negative(pthread_mutex_init(&shutdown_mtx, NULL), 
     "Error init mutex in process_control_initialize");
 
+  clock_tick = 0;
   last_pid = 0;
 
   // initialize the process lists
@@ -160,8 +191,6 @@ static void process_control_initialize() {
   all_prcs = vec_new(0, clean_up_pcb);
   blocked_prcs = vec_new(0, NULL);
   stopped_prcs = vec_new(0, NULL);
-  zombie_prcs = vec_new(0, NULL);
-  zombie_prcs = vec_new(0, NULL);
   pending_sig_prcs = vec_new(0, NULL);
 
   for (schedule_priority i = PRIORITY_1; i < PRIORITY_COUNT - 1; ++i) {
@@ -215,7 +244,6 @@ static void* init_routine(void* arg) {
 static void process_control_cleanup() {
   logger_log(logger, LOG_LEVEL_DEBUG, "process_control_cleanup started");
 
-  // TODO: cancel all the unfinished processes
   for (size_t i = 0; i < vec_len(&all_prcs); ++i) {
     pcb_t* pcb_ptr = vec_get(&all_prcs, i);
     if (pcb_ptr) {
@@ -226,14 +254,15 @@ static void process_control_cleanup() {
 
   vec_destroy(&blocked_prcs);
   vec_destroy(&stopped_prcs);
-  vec_destroy(&zombie_prcs);
   vec_destroy(&pending_sig_prcs);
 
   for (schedule_priority i = PRIORITY_1; i < PRIORITY_COUNT - 1; ++i) {
     vec_destroy(&ready_prcs_queues[i]);
   }
+  logger_log(logger, LOG_LEVEL_DEBUG, "Blocked / Stopped / Signal / Ready vecs destructed");
 
   vec_destroy(&all_prcs);
+  logger_log(logger, LOG_LEVEL_DEBUG, "all_prcs vec destructed");
 
   assert_non_negative(pthread_mutex_destroy(&shutdown_mtx), 
     "Error init mutex in process_control_initialize");
@@ -241,6 +270,65 @@ static void process_control_cleanup() {
   logger_log(logger, LOG_LEVEL_DEBUG, "process_control_cleanup completed");
 
   logger_close(logger);  
+
+}
+
+/**
+ * Examine the current blocked processes and unblock those with block condition not longer holds
+ */
+static void examine_blocked_processes() {
+  size_t index = 0;
+
+  while (index < vec_len(&blocked_prcs)) {
+    pcb_t* proc = vec_get(&blocked_prcs, index);
+    if (!proc) {
+      logger_log(logger, LOG_LEVEL_WARN, "Null PCB found in blocked_prcs in examine_blocked_processes");
+      vec_erase(&blocked_prcs, index);
+      continue;
+    }
+
+    if (proc->state == PROCESS_STATE_TERMINATED) {
+      logger_log(logger, LOG_LEVEL_DEBUG, "Terminated PCB found in blocked_prcs in examine_blocked_processes");
+      vec_erase(&blocked_prcs, index);
+      continue;
+    }
+
+    // check whether still blocked by sleep
+    if (proc->blocked_by_sleep) {
+      if (clock_tick != proc->wake_tick) {
+        // still sleeping
+        ++index;
+        continue;
+      } else {
+        // wake up time
+        proc->blocked_by_sleep = false;
+        proc->wake_tick = 0;
+      }
+    }
+
+    // have ensured not blocked by sleep, check whether still blocked by waitpid
+    
+    if (check_blocked_waiting_child(proc)) {
+      // still blocking on waitpid
+      ++index;
+      continue;
+    }
+
+    // no longer blocking
+    vec_erase(&blocked_prcs, index);
+
+    // schedule for running only if it is showing as BLOCKED previously
+    // should not do so for STOPPED as they should continue to be STOPPED even when
+    // the blocking condition is lifted
+    if (proc->state == PROCESS_STATE_BLOCKED) {
+      proc->state = PROCESS_STATE_READY;
+      vec_push_back(&ready_prcs_queues[proc->priority], proc);
+      logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] unblocks and ready for schedule", proc->pid);
+    } else {
+      logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] unblocks but still stopped", proc->pid);
+    }
+
+  }
 
 }
 
@@ -256,7 +344,7 @@ static void process_control_cleanup() {
  */
 static pcb_t* get_pcb_at_pid(pid_t pid) {
   if (pid <= 0) {
-    logger_log(logger, LOG_LEVEL_ERROR, "Attempt to get pcb for invalid PID (<= 0)");
+    logger_log(logger, LOG_LEVEL_WARN, "Attempt to get pcb for invalid PID (<= 0)");
     return NULL;
   }
 
@@ -333,7 +421,7 @@ static pid_t get_new_pid() {
 /**
  * @brief Prepare the PCB struct on heap and return the pointer to it.
  * @param pid its given pid
- * @param parent its parent PCB pointer; if it is NULL, pcb->parent will be set to 0
+ * @param parent its parent PCB pointer
  * @pre pid must be in range (1 to MAX_PID_NUMBER)
  * @pre if parent is not NULL, parent->pid must be in range
  * @return the pointer to the PCB created
@@ -362,19 +450,22 @@ static pcb_t* create_pcb(pid_t pid, pcb_t* parent) {
     // .spthread not set yet
     .pid = pid,
     .state = 0,
-    .priority = PRIORITY_2,
-    .parent = 0,
+    .priority = PRIORITY_2,   // all processes are by default PRIORITY_2 upon birth
+    .parent = NULL,
     .children = vec_new(0, NULL),
     .waitable_children = vec_new(0, NULL),
+    .blocked_by_sleep = false,
+    .wake_tick = 0,
+    .waitpid_stat = 0,
     .fds = vec_new(0, NULL),
     .pending_signals = 0
   };
 
   if (parent) {
-    pcb_ptr->parent = parent->pid;
+    pcb_ptr->parent = parent;
     pcb_ptr->fds = parent->fds;
     vec_push_back(&(parent->children), pcb_ptr);
-  } 
+  }
   return pcb_ptr;
 }
 
@@ -384,18 +475,25 @@ static pcb_t* create_pcb(pid_t pid, pcb_t* parent) {
 static void clean_up_pcb(void* pcb_void_ptr) {
   // ?? anything cleanup needed for spthread?
 
+  if (!pcb_void_ptr) {
+    logger_log(logger, LOG_LEVEL_WARN, "clean_up_pcb called on null");
+    return;
+  }
+
   pcb_t* pcb_ptr = (pcb_t*) pcb_void_ptr;
+  pid_t pid = pcb_ptr->pid;
+
   vec_destroy(&(pcb_ptr->children));
   vec_destroy(&(pcb_ptr->waitable_children));
   vec_destroy(&(pcb_ptr->fds));
   free(pcb_ptr);
-  logger_log(logger, LOG_LEVEL_DEBUG, "clean_up_pcb completed");
+  logger_log(logger, LOG_LEVEL_DEBUG, "clean_up_pcb completed for prev PID[%d]", pid);
 }
 
 /**
  * Find the PCB struct for the given spthread
  */
-static pcb_t* spthread_to_pcb (spthread_t spthread) {
+static pcb_t* get_pcb_by_spthread (spthread_t spthread) {
   for (size_t i = 0; i < vec_len(&all_prcs); ++i) {
     pcb_t* prc = (pcb_t*) vec_get(&all_prcs, i);
     if (prc != NULL && spthread_equal(prc->spthread, spthread)) {
@@ -403,7 +501,7 @@ static pcb_t* spthread_to_pcb (spthread_t spthread) {
     }
   }
 
-  logger_log(logger, LOG_LEVEL_ERROR, "Not able to find spthread in spthread_to_pcb");
+  logger_log(logger, LOG_LEVEL_ERROR, "Not able to find spthread in get_pcb_by_spthread");
   return NULL;
 }
 
@@ -422,7 +520,6 @@ static void* routine_exit_wrapper_func(void* wrapped_args) {
   free(wrapped_args);
 
   // call k_exit manually so that PCB is updated
-  logger_log(logger, LOG_LEVEL_DEBUG, "Trigger k_exit at end of routine");
   k_exit();
 
   return result;
@@ -470,6 +567,109 @@ static void set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), char* 
 
   proc->state = PROCESS_STATE_READY;
   vec_push_back(&ready_prcs_queues[proc->priority], proc);
+}
+
+/** Helper function to check whether the process should still block
+ * waiting for waiting_child_pid, by checking whether pcb->waitable_children
+ * has the child it is waiting on.
+ * @return true if it is waiting for a child (waiting_child_pid != 0) and
+ * pcb->waitable_children does not yet have that child
+ * @return false otherwise (if that child shows up in pcb->waitable_children, 
+ * or it is not waiting for a child)
+ */
+static bool check_blocked_waiting_child(pcb_t* pcb) {
+  if (!pcb) {
+    return false;
+  }
+
+  pid_t waiting_pid = pcb->waiting_child_pid;
+
+  if (waiting_pid == 0) {
+    return false;
+  }
+
+  if (waiting_pid == -1) {
+    return (vec_len(&pcb->waitable_children) == 0);
+  }
+
+  for (size_t i = 0; i < vec_len(&pcb->waitable_children); ++i) {
+    pcb_t* child_pcb = vec_get(&pcb->waitable_children, i);
+    if (!child_pcb) {
+      logger_log(logger, LOG_LEVEL_ERROR, "Null PCB in waitable_children in check_blocked_waiting_child");
+      continue;
+    }
+    if (child_pcb->pid == waiting_pid) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Have INIT adopt all children of the process pointed by pcb
+ */
+static void init_adopt_children(pcb_t* pcb) {
+  if (!pcb) {
+    return;
+  }
+
+  pcb_t* init_pcb = get_pcb_at_pid(INIT_PID);
+  assert_non_null(init_pcb, "INIT PCB not found in init_adopt_children");
+
+  for (size_t i = 0; i < vec_len(&pcb->children); ++i) {
+
+    pcb_t* child_pcb = vec_get(&pcb->children, i);
+    if (child_pcb && child_pcb->parent == pcb) {
+      child_pcb->parent = init_pcb;
+
+      vec_push_back(&init_pcb->children, child_pcb);
+      logger_log(logger, LOG_LEVEL_DEBUG, "INIT adopted child PID[%d] from PID[%d]", child_pcb->pid, pcb->pid);
+    } else {
+      logger_log(logger, LOG_LEVEL_ERROR, "INIT gave up adopting child PID[%d] as not child of PID[%d]", child_pcb->pid,  pcb->pid);
+    }
+  }
+
+  for (size_t i = 0; i < vec_len(&pcb->waitable_children); ++i) {
+    pcb_t* child_pcb = vec_get(&pcb->waitable_children, i);
+    // child's parent should already be updated to INIT
+    if (child_pcb && child_pcb->parent == init_pcb) {
+      vec_push_back(&init_pcb->waitable_children, child_pcb);
+      logger_log(logger, LOG_LEVEL_DEBUG, "INIT added waitable child PID[%d]", child_pcb->pid);
+    } else {
+      logger_log(logger, LOG_LEVEL_ERROR, "Invalid PCB when INIT add waitable child PID[%d]", child_pcb->pid);
+    } 
+  }
+
+  // clear children and waitable children upon adoption completion
+  vec_clear(&pcb->children);
+  vec_clear(&pcb->waitable_children);
+}
+
+/**
+ * Helper function to register a process that becomes blocking
+ * @note Does not necessarily change pcb->state to PROCESS_STATE_BLOCK if it was not READY
+ * @note Not to be called standalone! Should only be called by k_sleep and k_waitpid,
+ * and they are expected to set relevant metadata (wait_tick, blocked_by_sleep, waiting_child_pid)
+ * themselves
+ */
+static void register_blocked_state(pcb_t* pcb) {
+  vec_push_back(&blocked_prcs, pcb);
+
+  if (pcb->state == PROCESS_STATE_READY) {
+    pcb->state = PROCESS_STATE_BLOCKED;
+
+    // this is usually not needed as the running process is not in ready queue
+    if (remove_pcb_first_from_vec(pcb, &ready_prcs_queues[pcb->priority])) {
+      logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] removed from ready queue[%d]", pcb->pid, pcb->priority);
+    }
+    
+  }
+
+  // no need to change state if was STOPPED or BLOCKED
+  // since a stopped process should still be stopped when blocked or unblocked
+  // waiting_child_pid and blocked_by_sleep will indicate whether the process should be BLOCKED
+  // or READY when the stop condition is lifted (i.e. receives P_SIGCONT)
 }
 
 /**
@@ -524,6 +724,48 @@ static schedule_priority scheduler_get_next_priority() {
   return next;
 }
 
+/**
+ * Helper function to find the first occurence of pcb_ptr in a Vec and remove it if found
+ * @return true if found and removed; false if not found
+ */
+static bool remove_pcb_first_from_vec(pcb_t* pcb_ptr, Vec* vec) {
+  if (!pcb_ptr || !vec) {
+    logger_log(logger, LOG_LEVEL_WARN, "PCB or Vec null in remove_pcb_first_from_vec");
+    return false;
+  }
+
+  for (size_t i = 0; i < vec_len(vec); ++i) {
+    if (pcb_ptr == vec_get(vec, i)) {
+      vec_erase(vec, i);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Helper function to find the all occurences of pcb_ptr in a Vec and remove it if found
+ * @return number of occurences found and removed; 0 if not found
+ */
+static int remove_pcb_all_from_vec(pcb_t* pcb_ptr, Vec* vec) {
+  if (!pcb_ptr || !vec) {
+    logger_log(logger, LOG_LEVEL_WARN, "PCB or Vec null in remove_pcb_all_from_vec");
+    return 0;
+  }
+
+  int count = 0;
+
+  for (int i = vec_len(vec) - 1; i >= 0; --i) {
+    if (pcb_ptr == vec_get(vec, i)) {
+      vec_erase(vec, i);
+      ++count;
+    }
+  }
+
+  return count;
+}
+
 /********************
  * public functions *
  ********************/
@@ -532,6 +774,7 @@ static schedule_priority scheduler_get_next_priority() {
   // the scheduler should not be called another time
   static bool scheduler_started = false;
   if (scheduler_started) {
+    logger_log(logger, LOG_LEVEL_WARN, "k_scheduler already run before");
     return;
   }
   scheduler_started = true;
@@ -586,22 +829,41 @@ static schedule_priority scheduler_get_next_priority() {
 
       spthread_continue(pcb_next_run->spthread);
       sigsuspend(&suspend_set);
+      ++clock_tick;
       spthread_suspend(pcb_next_run->spthread);
+
+      // register async keyboard signals
+      // TODO
+      // process signals during this quantum
+      // TODO
+      // examine blocked processes
+      examine_blocked_processes();
 
       if (pcb_next_run->state == PROCESS_STATE_READY) {
         vec_push_back(&ready_prcs_queues[pcb_next_run->priority], pcb_next_run);
       }
+
+      next_priority = scheduler_get_next_priority();
+
     } else if (vec_len(&ready_prcs_queues[PRIORITY_1]) == 0 && vec_len(&ready_prcs_queues[PRIORITY_2]) == 0
-    && vec_len(&ready_prcs_queues[PRIORITY_3]) == 0) {
+          && vec_len(&ready_prcs_queues[PRIORITY_3]) == 0) {
       // all ready queue is empty
       logger_log(logger, LOG_LEVEL_DEBUG, "All queue empty!", next_priority);
       sigsuspend(&suspend_set);
-      continue;
+      ++clock_tick;
+
+      // register async keyboard signals
+      // TODO
+      // process signals during this quantum
+      // TODO
+      // examine blocked processes
+      examine_blocked_processes();
+
     } else {
       logger_log(logger, LOG_LEVEL_DEBUG, "Queue[%d] empty so pass", next_priority);
+      next_priority = scheduler_get_next_priority();
     }
 
-    next_priority = scheduler_get_next_priority();
   }
 
   process_control_cleanup();
@@ -610,17 +872,14 @@ static schedule_priority scheduler_get_next_priority() {
 pcb_t* k_proc_create(pcb_t* parent) {
   create_init();
 
-  pcb_t* pcb_ptr;
+  pcb_t* pcb_ptr = NULL;
 
   if (parent) {
     pcb_ptr = create_pcb(get_new_pid(), parent);
 
   } else {
     pcb_t* init_pcb_ptr = get_pcb_at_pid(1);
-    if (!init_pcb_ptr) {
-      logger_log(logger, LOG_LEVEL_ERROR, "INIT PCB not found in all_procs");
-      return NULL;
-    }
+    assert_non_null(init_pcb_ptr, "INIT PCB not found in all_procs");
 
     pcb_ptr = create_pcb(get_new_pid(), init_pcb_ptr);
   }
@@ -637,25 +896,145 @@ void k_set_routine_and_run(pcb_t* proc, void* (*func)(void*), char* argv[]) {
 }
 
 void k_proc_cleanup(pcb_t* proc) {
-  // TODO
+  if (proc->state != PROCESS_STATE_TERMINATED) {
+    logger_log(logger, LOG_LEVEL_WARN, "k_proc_cleanup not done as process not terminated");
+    return;
+  }
+
+  // join spthread
+  spthread_cancel_and_join(proc->spthread);
+
+  pcb_t* parent_pcb = proc->parent;
+  assert_non_null(parent_pcb, "Parent PCB null in k_proc_cleanup");
+  
+  // remove from parent's child vec
+  // assume waitable children has been cleaned up
+  if (!remove_pcb_first_from_vec(proc, &parent_pcb->children)) {
+    logger_log(logger, LOG_LEVEL_WARN, "Cannot find reaped child in k_waitpid");
+  }
+  // double check whether all children has gone (been adopted previously)
+  if (vec_len(&proc->children) > 0 || vec_len(&proc->waitable_children) > 0) {
+    logger_log(logger, LOG_LEVEL_WARN, "Unadopted orphan found in k_waitpid");
+    init_adopt_children(proc);
+  }
+  
+  // remove the pcb from all_prcs, which will automatically destruct the PCB
+  pid_t my_pid = proc->pid;
+  logger_log(logger, LOG_LEVEL_DEBUG, "Setting all_prcs for PID %d to NULL", my_pid);
+  set_pcb_at_pid(my_pid, NULL);
+
+}
+
+pid_t k_waitpid(pid_t pid, int* wstatus, bool nohang) {
+  if (pid < -1) {
+    // TODO: set errno
+    return -1;
+  }
+
+  pcb_t* child_pcb = NULL;      // pcb null indicates wait for any child in this function
+  pcb_t* self_pcb = k_get_self_pcb();
+
+  // check whether the specified PID is indeed a child
+  if (pid != -1) {
+    child_pcb = get_pcb_at_pid(pid);
+    if (!child_pcb || child_pcb->parent != self_pcb) {
+      // TODO: set errno ECHILD
+      return -1;
+    }
+  }
+
+  while (true) {
+    // try finding this child in waitable_children
+    pcb_t* waited_child = NULL;
+    for (size_t i = 0; i < vec_len(&self_pcb->waitable_children); ++i) {
+      pcb_t* waitable_child = vec_get(&self_pcb->waitable_children, i);
+      if (!child_pcb || waitable_child == child_pcb) {
+        waited_child = waitable_child;
+        break;
+      }
+    }
+
+    if (waited_child) {
+      // found waited child
+      logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] found waited child", self_pcb->pid);
+
+      // successfully found child to wait for
+      pid_t waited_child_pid = waited_child->pid;
+      // TODO: set wstatus for EXIT stat
+      if (wstatus) {
+        *wstatus = waited_child->waitpid_stat;
+      }
+      
+      // clear this child from waitable_children
+      int wchd_removed = remove_pcb_all_from_vec(waited_child, &self_pcb->waitable_children);
+      if (wchd_removed > 0) {
+        logger_log(logger, LOG_LEVEL_DEBUG, 
+          "%d PID[%d] removed from waitable_children", wchd_removed, waited_child_pid);
+      } else {
+        logger_log(logger, LOG_LEVEL_WARN, 
+          "PID[%d] not found in waitable_children", wchd_removed, waited_child_pid);
+      }
+
+      // clear waiting child (indication of block on waitpid)
+      self_pcb->waiting_child_pid = 0;
+
+      // if waited child has terminated (zombie), reap it
+      if (waited_child->state == PROCESS_STATE_TERMINATED) {
+        k_proc_cleanup(waited_child);
+      }
+
+      return waited_child_pid;
+
+    } else {
+      // have not found a child to wait, register block info and block, or return 0 for nohang
+      if (nohang) {
+        return 0;
+      }
+
+      logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] cannot find waited child, will start blocking", self_pcb->pid);
+      self_pcb->waiting_child_pid = pid;
+      register_blocked_state(self_pcb);
+
+      assert_non_negative(spthread_suspend_self(), "spthread_suspend_self error in k_waitpid");
+    }
+  }
+}
+
+void k_sleep(clock_tick_t ticks) {
+  pcb_t* self_pcb = k_get_self_pcb();
+  assert_non_null(self_pcb, "Self PCB null in k_sleep");
+
+  if (self_pcb->state == PROCESS_STATE_TERMINATED) {
+    return;
+  }
+
+  self_pcb->blocked_by_sleep = true;
+  self_pcb->wake_tick = clock_tick + ticks;
+  register_blocked_state(self_pcb);
+
+  assert_non_negative(spthread_suspend_self(), "spthread_suspend_self error in k_sleep");
+
 }
 
 void k_exit(void) {
 
-  spthread_t spthread;
-  if (!spthread_self(&spthread)) {
-    logger_log(logger, LOG_LEVEL_ERROR, "Current thread not a spthread in k_exit");
-    return;
+  pcb_t* self_pcb = k_get_self_pcb();
+  assert_non_null(self_pcb, "PCB not found in k_exit");
+  logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] running k_exit", self_pcb->pid);
+
+  // add self to parent's waitable children
+  if (self_pcb->parent) {
+    vec_push_back(&(self_pcb->parent->waitable_children), self_pcb);
   }
 
-  pcb_t* pcb_ptr = spthread_to_pcb(spthread);
-  assert_non_null(pcb_ptr, "PCB not found in k_exit");
-  pcb_ptr->state = PROCESS_STATE_TERMINATED;
+  // have INIT adopt all children (and waitable children)
+  logger_log(logger, LOG_LEVEL_DEBUG,
+    "Triggering INIT adoption in k_exit for PID[%d] (%zu children, %zu waitable_children)",
+    self_pcb->pid, vec_len(&self_pcb->children), vec_len(&self_pcb->waitable_children));
+  init_adopt_children(self_pcb);
 
-  pcb_t* parent_ptr = get_pcb_at_pid(pcb_ptr->parent);
-  assert_non_null(pcb_ptr, "Parent PCB not found in k_exit");
-  vec_push_back(&(parent_ptr->waitable_children), pcb_ptr);
-
+  self_pcb->state = PROCESS_STATE_TERMINATED;
+  
   spthread_exit(NULL);
 }
 
@@ -667,11 +1046,66 @@ void k_shutdown(void) {
   assert_non_negative(spthread_enable_interrupts_self(), "Error enable_interrupts in k_shutdown");
 }
 
+pcb_t* k_get_self_pcb() {
+  spthread_t spthread;
+  if (!spthread_self(&spthread)) {
+    logger_log(logger, LOG_LEVEL_ERROR, "Current thread not a spthread in k_get_self_pcb");
+    return NULL;
+  }
+
+  pcb_t* pcb_ptr = get_pcb_by_spthread(spthread);
+  assert_non_null(pcb_ptr, "PCB not found in k_get_self_pcb");
+
+  return pcb_ptr;
+}
+
+pid_t k_get_pid(pcb_t* pcb_ptr) {
+  if (!pcb_ptr) {
+    logger_log(logger, LOG_LEVEL_WARN, "Null pcb in k_get_pid");
+    return -1;
+  }
+  return pcb_ptr->pid;
+}
+
+void k_printprocess() {
+  fprintf(stderr, "PID\tPPID\tPRI\tSTAT\tCMD\n");
+
+  for (size_t i = 0; i < vec_len(&all_prcs); ++i) {
+    pcb_t* pcb_ptr = vec_get(&all_prcs, i);
+    // skip the PIDs not allocated
+    if (!pcb_ptr) {
+      continue;
+    }
+    pid_t parent_pid = (pcb_ptr->parent) ? pcb_ptr->parent->pid : 0;
+
+    char stat;
+    switch (pcb_ptr->state) {
+      case PROCESS_STATE_READY:
+        stat = 'R';
+        break;
+      case PROCESS_STATE_STOPPED:
+        stat = 'S';
+        break;
+      case PROCESS_STATE_BLOCKED:
+        stat = 'B';
+        break;
+      case PROCESS_STATE_TERMINATED:
+        stat = 'Z';
+        break;
+      default:
+        stat = 'U';
+    }
+
+    if (pcb_ptr) {
+      fprintf(stderr, "%d\t%d\t%d\t%c\t%s\n", pcb_ptr->pid, parent_pid, pcb_ptr->priority, stat, "?");
+    }
+  }
+}
 
 void k_set_logger(Logger* new_logger) {
   // check for null
   if (new_logger) {
-    free(logger);
+    logger_close(logger);
     logger = new_logger;
     logger_log(logger, LOG_LEVEL_DEBUG, "new logger set in k_set_logger");
   } else {

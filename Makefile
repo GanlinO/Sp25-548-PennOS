@@ -18,7 +18,7 @@ CPPFLAGS = -I $(SRC_DIR)
 # for example:
 # TEST_MAINS = $(TESTS_DIR)/test1.c $(TESTS_DIR)/othertest.c $(TESTS_DIR)/sched-demo.c
 # TEST_MAINS = $(TESTS_DIR)/sched-demo.c 
-TEST_MAINS = $(TESTS_DIR)/sched-demo.c $(TESTS_DIR)/process_control_tst.c $(TESTS_DIR)/scheduling_pattern_tst.c
+TEST_MAINS = $(TESTS_DIR)/sched-demo.c $(TESTS_DIR)/process_control_tst.c $(TESTS_DIR)/scheduling_pattern_tst.c $(TESTS_DIR)/shell_syscalls_tst.c
 
 # list all files with their own main() function here
 # for example:

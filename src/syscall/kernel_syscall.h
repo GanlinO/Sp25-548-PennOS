@@ -21,12 +21,13 @@ pid_t s_spawn(void* (*func)(void*), char* argv[], int fd0, int fd1);
  * If `nohang` is true, this will not block the calling process and return
  * immediately.
  *
- * @param pid Process ID of the child to wait for.
+ * @param pid Process ID of the child to wait for. If set to -1, wait for any child.
  * @param wstatus Pointer to an integer variable where the status will be
  * stored.
  * @param nohang If true, return immediately if no child has exited.
  * @return pid_t The process ID of the child which has changed state on success,
- * -1 on error.
+ * -1 on error. If nohang is set and no child to wait for, returns 0.
+ * @note Error no: ECHILD if the pid specified is not a child of the caller
  */
 pid_t s_waitpid(pid_t pid, int* wstatus, bool nohang);
 
@@ -65,6 +66,13 @@ int s_nice(pid_t pid, int priority);
  * @param ticks Duration of the sleep in system clock ticks. Must be greater
  * than 0.
  */
-void s_sleep(unsigned int ticks);
+void s_sleep(clock_tick_t ticks);
+
+/**
+ * @brief List all processes on PennOS, displaying PID, PPID, priority, status,
+ * and command name.
+ *
+ */
+void s_printprocess(void);
 
 #endif  // KERNEL_SYSCALL_H_

@@ -1,6 +1,19 @@
 #ifndef SHELL_H_
 #define SHELL_H_
 
+/*****************************************
+ *          MAIN PROGRAM                 *
+ *****************************************/
+
+/**
+ * @brief The main shell loop
+ */
+void* shell_main(void* arg);
+
+/******************************************
+ *     INDEPENDENT BUILT-INS              *
+ ******************************************/
+
 /**
  * @brief The ususal `cat` program.
  *
@@ -21,7 +34,7 @@ void* cat(void* arg);
  *
  * Example Usage: sleep 10
  */
-void* sleep(void* arg);
+void* u_sleep(void* arg);
 
 /**
  * @brief Busy wait indefinitely.
@@ -137,14 +150,14 @@ void* kill(void* arg);
  *
  * Example Usage: nice 2 cat f1 f2 f3 (spawns cat with priority 2)
  */
-void* nice(void* arg);
+void* u_nice(void* arg);
 
 /**
  * @brief Adjust the priority level of an existing process.
  *
  * Example Usage: nice_pid 0 123 (sets priority 0 to PID 123)
  */
-void* nice_pid(void* arg);
+void* u_nice_pid(void* arg);
 
 /**
  * @brief Lists all available commands.

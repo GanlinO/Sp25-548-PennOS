@@ -129,7 +129,7 @@ void vec_erase(Vec* self, size_t index) {
 
   // move elements
   ptr_t* data = self->data;
-  for (size_t i = index; i < length; ++i) {
+  for (size_t i = index; i < length - 1; ++i) {
     *(data + i) = *(data + i + 1);
   }
   --(self->length);
