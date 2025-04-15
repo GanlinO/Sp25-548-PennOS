@@ -47,7 +47,7 @@ static thd_func_t get_func_from_cmd(const char * cmd_name);
 
 void* shell_main(void* arg) {
   buf_len = INITIAL_BUF_LEN;
-  buf = malloc(sizeof(buf_len));
+  buf = malloc(sizeof(char) * buf_len);
   assert_non_null(buf, "Error mallocing for buf");
 
   struct parsed_command* cmd = NULL;
@@ -133,9 +133,16 @@ void* orphan_child(void* arg) {
   return NULL;
 }
 
+void* orphan_child_autodie(void* arg) {
+  s_sleep(20);
+  return NULL;
+}
+
 void* orphanify(void* arg) {
   char* args[] = {"orphan_child", NULL};
   s_spawn(orphan_child, args, 0, 1);
+  char* args2[] = {"orphan_child_autodie", NULL};
+  s_spawn(orphan_child_autodie, args2, 0, 1);
   return NULL;
 }
 

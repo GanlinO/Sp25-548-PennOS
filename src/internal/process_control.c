@@ -171,7 +171,7 @@ static schedule_priority scheduler_get_next_priority();
 static void set_process_name(pcb_t* pcb, const char* process_name);
 
 static void schedule_event_log(pcb_t* proc, schedule_priority priority);
-static void lifetime_event_log(pcb_t* proc, char* event_name);
+static void lifecycle_event_log(pcb_t* proc, char* event_name, char* add_msg);
 
 static void init_adopt_children(pcb_t* pcb);
 static void register_blocked_state(pcb_t* pcb);
@@ -686,10 +686,13 @@ static void* routine_exit_wrapper_func(void* wrapped_args) {
     return NULL;
   }
 
-  routine_exit_wrapper_args_t* args = (routine_exit_wrapper_args_t*) wrapped_args;
-  void* result = args->func(args->arg);
+  routine_exit_wrapper_args_t* unwrapped_args_ptr = (routine_exit_wrapper_args_t*) wrapped_args;
+  void* (*original_func) (void*) = unwrapped_args_ptr->func;
+  void* original_arg = unwrapped_args_ptr->arg;
 
   free(wrapped_args);
+
+  void* result = original_func(original_arg);  
 
   // call k_exit manually so that PCB is updated
   k_exit();
@@ -757,7 +760,7 @@ static void set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), void* 
   proc->state = PROCESS_STATE_READY;
   vec_push_back(&ready_prcs_queues[proc->priority], proc);
 
-  lifetime_event_log(proc, "CREATED");
+  lifecycle_event_log(proc, "CREATED", NULL);
 }
 
 /** Helper function to check whether the process should still block
@@ -817,7 +820,7 @@ static void init_adopt_children(pcb_t* pcb) {
       vec_push_back(&init_pcb->children, child_pcb);
       logger_log(logger, LOG_LEVEL_DEBUG, "INIT adopted child PID[%d] from PID[%d]", child_pcb->pid, pcb->pid);
 
-      lifetime_event_log(child_pcb, "ORPHAN");
+      lifecycle_event_log(child_pcb, "ORPHAN", NULL);
     } else {
       logger_log(logger, LOG_LEVEL_ERROR, "INIT gave up adopting child PID[%d] as not child of PID[%d]", child_pcb->pid,  pcb->pid);
     }
@@ -938,7 +941,7 @@ static void set_process_name(pcb_t* pcb, const char* process_name) {
 }
 
 /**
- * Helper function to print log the life cycle events
+ * Helper function to print log the schedule events
  */
 static void schedule_event_log(pcb_t* proc, schedule_priority priority) {
   if (!proc) {
@@ -949,13 +952,18 @@ static void schedule_event_log(pcb_t* proc, schedule_priority priority) {
     clock_tick, "SCHEDULE", proc->pid, priority, (proc->process_name) ? proc->process_name : "?");
 }
 
-static void lifetime_event_log(pcb_t* proc, char* event_name){
+/**
+ * Helper function to print log the life cycle events
+ */
+static void lifecycle_event_log(pcb_t* proc, char* event_name, char* add_msg){
   if (!proc) {
-    logger_log(logger, LOG_LEVEL_WARN, "PCB null in lifetime_event_log");
+    logger_log(logger, LOG_LEVEL_WARN, "PCB null in lifecycle_event_log");
     return;
   }
-  logger_log(logger, LOG_LEVEL_INFO, "\t[%4d]\t%-7s\t%d\t%d\t%s",
-    clock_tick, (event_name) ? event_name : "", proc->pid, proc->priority, (proc->process_name) ? proc->process_name : "?");
+  logger_log(logger, LOG_LEVEL_INFO, "\t[%4d]\t%-7s\t%d\t%d\t%s %s",
+    clock_tick, (event_name) ? event_name : "<EVENT>", proc->pid,
+    proc->priority, (proc->process_name) ? proc->process_name : "<null>",
+    (add_msg) ? add_msg : "");
 }
 
 /**
@@ -1072,7 +1080,6 @@ void k_proc_cleanup(pcb_t* proc) {
   
   // remove the pcb from all_prcs, which will automatically destruct the PCB
   pid_t my_pid = proc->pid;
-  lifetime_event_log(proc, "WAITED");
   logger_log(logger, LOG_LEVEL_DEBUG, "Setting all_prcs for PID %d to NULL", my_pid);
   set_pcb_at_pid(my_pid, NULL);
 
@@ -1101,7 +1108,12 @@ pid_t k_waitpid(pid_t pid, int* wstatus, bool nohang) {
     pcb_t* waited_child = NULL;
     for (size_t i = 0; i < vec_len(&self_pcb->waitable_children); ++i) {
       pcb_t* waitable_child = vec_get(&self_pcb->waitable_children, i);
-      if (!child_pcb || waitable_child == child_pcb) {
+      if (waitable_child && (!child_pcb || waitable_child == child_pcb)) {
+        if (waitable_child->parent != self_pcb) {
+          logger_log(logger, LOG_LEVEL_WARN, "Waitable child[%d]'s parent [%d] not match waiting process [%d], waited anyway",
+            waitable_child->pid, (waitable_child->parent) ? (waitable_child->parent->pid) : 0, self_pcb->pid);
+        }
+
         waited_child = waitable_child;
         break;
       }
@@ -1130,6 +1142,9 @@ pid_t k_waitpid(pid_t pid, int* wstatus, bool nohang) {
 
       // clear waiting child (indication of block on waitpid)
       self_pcb->waiting_child_pid = 0;
+
+      // log lifetime event just before the pcb cleanup (as data will be lost after reaping)
+      lifecycle_event_log(waited_child, "WAITED", (self_pcb->pid == INIT_PID) ? "(by init)" : NULL);
 
       // if waited child has terminated (zombie), reap it
       if (waited_child->state == PROCESS_STATE_TERMINATED) {
@@ -1175,14 +1190,14 @@ void k_exit(void) {
   assert_non_null(self_pcb, "PCB not found in k_exit");
   logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] running k_exit", self_pcb->pid);
 
-  lifetime_event_log(self_pcb, "EXITED");
+  lifecycle_event_log(self_pcb, "EXITED", NULL);
 
   // add self to parent's waitable children
   if (self_pcb->parent) {
     vec_push_back(&(self_pcb->parent->waitable_children), self_pcb);
   }
 
-  lifetime_event_log(self_pcb, "ZOMBIE");
+  lifecycle_event_log(self_pcb, "ZOMBIE", NULL);
 
   // have INIT adopt all children (and waitable children)
   logger_log(logger, LOG_LEVEL_DEBUG,

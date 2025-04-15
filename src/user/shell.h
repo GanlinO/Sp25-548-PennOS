@@ -215,9 +215,14 @@ void* zombie_child(void* arg);
 void* zombify(void* arg);
 
 /**
- * @brief Helper for orphanify.
+ * @brief Helper for orphanify. Keeps spinning until killed.
  */
 void* orphan_child(void* arg);
+
+/**
+ * @brief Another helper for orphanify. Automatically exit in a few ticks.
+ */
+void* orphan_child_autodie(void* arg);
 
 /**
  * @brief Used to test orphanifying functionality of your kernel.
