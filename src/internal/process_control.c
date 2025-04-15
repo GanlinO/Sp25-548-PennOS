@@ -5,6 +5,7 @@
 
 #include <stdlib.h>
 #include <signal.h>           // for scheduler handling SIGALRM
+#include <string.h>           // for strlen and strcpy for process name
 
 /********************
  *    definitions   *
@@ -20,6 +21,9 @@
 #define MILLISECOND_IN_USEC (1000)
 #define SECOND_IN_USEC (1000000)
 #define CLOCK_TICK_IN_USEC (800 * MILLISECOND_IN_USEC)
+
+#define INIT_PROCESS_NAME "INIT"
+#define DEFAULT_PROCESS_NAME "(unknown)"
 
 #define PROCESS_CONTROL_MODULE_NAME "PROCESS_CONTROL"
 
@@ -53,6 +57,7 @@ typedef enum process_state {
  * - own wstatus if the parent calls waitpid on it
  * - file descriptors
  * - pending signals
+ * - process name (for ps printing)
  */ 
 struct pcb_t {
   spthread_t spthread;
@@ -68,6 +73,7 @@ struct pcb_t {
   int waitpid_stat;
   Vec fds;
   signal_t pending_signals;
+  char* process_name;
 };
 
 /**
@@ -162,6 +168,7 @@ static pcb_t* get_pcb_by_spthread (spthread_t spthread);
 static void set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), void* arg, bool wrap_exit);
 static bool check_blocked_waiting_child(pcb_t* pcb);
 static schedule_priority scheduler_get_next_priority();
+static void set_process_name(pcb_t* pcb, const char* process_name);
 
 static void init_adopt_children(pcb_t* pcb);
 static void register_blocked_state(pcb_t* pcb);
@@ -374,8 +381,11 @@ static void* init_routine(void* arg) {
   const pid_t starting_shell_pid = starting_shell_pcb->pid;
   set_pcb_at_pid(starting_shell_pid, starting_shell_pcb);
   set_routine_and_run_helper(starting_shell_pcb, args_to_init->shell_func, args_to_init->shell_arg, true);
-
   free(arg);
+
+  if (strcmp(starting_shell_pcb->process_name, DEFAULT_PROCESS_NAME) == 0) {
+    set_process_name(starting_shell_pcb, "SHELL");
+  }
 
   while (true) {
     pid_t waited_pid = k_waitpid(-1, NULL, false);
@@ -613,7 +623,8 @@ static pcb_t* create_pcb(pid_t pid, pcb_t* parent) {
     .wake_tick = 0,
     .waitpid_stat = 0,
     .fds = vec_new(0, NULL),
-    .pending_signals = 0
+    .pending_signals = 0,
+    .process_name = NULL
   };
 
   if (parent) {
@@ -637,6 +648,8 @@ static void clean_up_pcb(void* pcb_void_ptr) {
 
   pcb_t* pcb_ptr = (pcb_t*) pcb_void_ptr;
   pid_t pid = pcb_ptr->pid;
+
+  free(pcb_ptr->process_name);
 
   vec_destroy(&(pcb_ptr->children));
   vec_destroy(&(pcb_ptr->waitable_children));
@@ -719,6 +732,26 @@ static void set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), void* 
     create_status = spthread_create(&(proc->spthread), NULL, func, arg);
   }
   assert_non_negative(create_status, "spthread create error");
+
+  logger_log(logger, LOG_LEVEL_DEBUG, "Set routing started");
+
+  // set up process name
+
+
+  char* process_name = NULL;
+
+  if (proc->pid ==INIT_PID) {
+    process_name = INIT_PROCESS_NAME;
+  } else if (arg == NULL) {
+    process_name = DEFAULT_PROCESS_NAME;
+  } else {
+    char** argv = (char**) arg;
+    process_name = argv[0];
+  }
+
+  set_process_name(proc, process_name);
+  
+  logger_log(logger, LOG_LEVEL_DEBUG, "Process name set for PID[%d]: %s", proc->pid, proc->process_name);
 
   proc->state = PROCESS_STATE_READY;
   vec_push_back(&ready_prcs_queues[proc->priority], proc);
@@ -877,6 +910,26 @@ static schedule_priority scheduler_get_next_priority() {
   #endif
 
   return next;
+}
+
+/**
+ * Set the name of a process in PCB
+ * If process_name is NULL, will set it to DEFAULT_PROCESS_NAME
+ */
+static void set_process_name(pcb_t* pcb, const char* process_name) {
+
+  if (process_name == NULL) {
+    logger_log(logger, LOG_LEVEL_DEBUG, "process_name null in set_process_name");
+    process_name = DEFAULT_PROCESS_NAME;
+  }
+
+  free(pcb->process_name);
+
+  pcb->process_name = malloc(strlen(process_name) + 1);
+  assert_non_null(pcb->process_name, "Malloc failed for process name in set_process_name");
+
+  strcpy(pcb->process_name, process_name);
+  assert_non_null(pcb->process_name, "Strcpy failed in set_process_name");
 }
 
 /**
@@ -1170,7 +1223,7 @@ void k_printprocess() {
     }
 
     if (pcb_ptr) {
-      fprintf(stderr, "%d\t%d\t%d\t%c\t%s\n", pcb_ptr->pid, parent_pid, pcb_ptr->priority, stat, "?");
+      fprintf(stderr, "%d\t%d\t%d\t%c\t%s\n", pcb_ptr->pid, parent_pid, pcb_ptr->priority, stat, (pcb_ptr->process_name) ? pcb_ptr->process_name : "NULL!");
     }
   }
 }

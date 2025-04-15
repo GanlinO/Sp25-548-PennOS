@@ -9,7 +9,8 @@ int main() {
   logger_log(logger, LOG_LEVEL_INFO, "start");
   k_set_logger(logger);
 
-  k_kernel_start(shell_main, NULL);
+  char* args[] = {"shell", NULL};
+  k_kernel_start(shell_main, args);
 
   fprintf(stderr, "END\n");
 }

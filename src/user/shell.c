@@ -39,6 +39,8 @@ cmd_func_match_t independent_funcs[] = {
 static struct parsed_command* read_command();
 static thd_func_t get_func_from_cmd(const char * cmd_name);
 
+[[maybe_unused]] static void debug_print(struct parsed_command*);
+
 /*****************************************
  *          MAIN PROGRAM                 *
  *****************************************/
@@ -61,11 +63,11 @@ void* shell_main(void* arg) {
       continue;
     }
 
-    fprintf(stderr, "Command arg[0]: %s\n", cmd->commands[0][0]);
+    // fprintf(stderr, "Command arg[0]: %s\n", cmd->commands[0][0]);
 
     thd_func_t func = get_func_from_cmd(cmd->commands[0][0]);
     if (func == NULL) {
-      fprintf(stderr, "Command not recognized\n");
+      fprintf(stderr, "Command not recognized: %s\n", cmd->commands[0][0]);
       continue;
     }
 
@@ -119,7 +121,7 @@ void* zombie_child(void* arg) {
 }
 
 void* zombify(void* arg) {
-  char* args[] = {NULL};
+  char* args[] = {"zombie_child", NULL};
   s_spawn(zombie_child, args, 0, 1);
   while (1);
   return NULL;
@@ -132,7 +134,7 @@ void* orphan_child(void* arg) {
 }
 
 void* orphanify(void* arg) {
-  char* args[] = {NULL};
+  char* args[] = {"orphan_child", NULL};
   s_spawn(orphan_child, args, 0, 1);
   return NULL;
 }
@@ -202,4 +204,17 @@ static thd_func_t get_func_from_cmd(const char * cmd_name) {
   }
 
   return NULL;
+}
+
+static void debug_print(struct parsed_command* cmd) {
+
+  char** cmd0 = cmd->commands[0];
+  size_t idx = 0;
+
+  fprintf(stderr, "debug_print\n");
+  while (cmd0[idx]) {
+    fprintf(stderr, "%zu: %s\n", idx, cmd0[idx]);
+    ++idx;
+  }
+
 }
