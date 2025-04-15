@@ -367,6 +367,9 @@ static void* init_routine(void* arg) {
 
   pcb_t* starting_shell_pcb = create_pcb(get_new_pid(), args_to_init->init_pcb);
   assert_non_null(starting_shell_pcb, "Created shell PCB is null in init_routine");
+
+  // the shell should be run with top priority
+  starting_shell_pcb->priority = PRIORITY_1;
   
   const pid_t starting_shell_pid = starting_shell_pcb->pid;
   set_pcb_at_pid(starting_shell_pid, starting_shell_pcb);
