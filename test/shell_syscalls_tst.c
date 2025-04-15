@@ -6,7 +6,7 @@ int main() {
   // pseudo PennOS
 
   Logger* logger = logger_init_stderr(LOG_LEVEL_INFO, "PROCESS CONTROL TEST");
-  logger_log(logger, LOG_LEVEL_INFO, "start");
+  logger_log(logger, LOG_LEVEL_INFO, "PennOS starts");
   k_set_logger(logger);
 
   char* args[] = {"shell", NULL};

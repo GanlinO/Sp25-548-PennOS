@@ -20,7 +20,7 @@
 
 #define MILLISECOND_IN_USEC (1000)
 #define SECOND_IN_USEC (1000000)
-#define CLOCK_TICK_IN_USEC (800 * MILLISECOND_IN_USEC)
+#define CLOCK_TICK_IN_USEC (100 * MILLISECOND_IN_USEC)
 
 #define INIT_PROCESS_NAME "INIT"
 #define DEFAULT_PROCESS_NAME "(unknown)"
@@ -170,6 +170,9 @@ static bool check_blocked_waiting_child(pcb_t* pcb);
 static schedule_priority scheduler_get_next_priority();
 static void set_process_name(pcb_t* pcb, const char* process_name);
 
+static void schedule_event_log(pcb_t* proc, schedule_priority priority);
+static void lifetime_event_log(pcb_t* proc, char* event_name);
+
 static void init_adopt_children(pcb_t* pcb);
 static void register_blocked_state(pcb_t* pcb);
 
@@ -254,6 +257,7 @@ static void kernel_scheduler() {
 
       logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] (priority %d) picked to run by scheduler",
         pcb_next_run->pid, next_priority);
+      schedule_event_log(pcb_next_run, next_priority);
 
       spthread_continue(pcb_next_run->spthread);
       sigsuspend(&suspend_set);
@@ -736,10 +740,7 @@ static void set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), void* 
   logger_log(logger, LOG_LEVEL_DEBUG, "Set routing started");
 
   // set up process name
-
-
   char* process_name = NULL;
-
   if (proc->pid ==INIT_PID) {
     process_name = INIT_PROCESS_NAME;
   } else if (arg == NULL) {
@@ -755,6 +756,8 @@ static void set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), void* 
 
   proc->state = PROCESS_STATE_READY;
   vec_push_back(&ready_prcs_queues[proc->priority], proc);
+
+  lifetime_event_log(proc, "CREATED");
 }
 
 /** Helper function to check whether the process should still block
@@ -813,6 +816,8 @@ static void init_adopt_children(pcb_t* pcb) {
 
       vec_push_back(&init_pcb->children, child_pcb);
       logger_log(logger, LOG_LEVEL_DEBUG, "INIT adopted child PID[%d] from PID[%d]", child_pcb->pid, pcb->pid);
+
+      lifetime_event_log(child_pcb, "ORPHAN");
     } else {
       logger_log(logger, LOG_LEVEL_ERROR, "INIT gave up adopting child PID[%d] as not child of PID[%d]", child_pcb->pid,  pcb->pid);
     }
@@ -933,6 +938,27 @@ static void set_process_name(pcb_t* pcb, const char* process_name) {
 }
 
 /**
+ * Helper function to print log the life cycle events
+ */
+static void schedule_event_log(pcb_t* proc, schedule_priority priority) {
+  if (!proc) {
+    logger_log(logger, LOG_LEVEL_WARN, "PCB null in schedule_event_log");
+    return;
+  }
+  logger_log(logger, LOG_LEVEL_DEBUG, "\t[%4d]\t%-7s\t%d\t%d\t%s",
+    clock_tick, "SCHEDULE", proc->pid, priority, (proc->process_name) ? proc->process_name : "?");
+}
+
+static void lifetime_event_log(pcb_t* proc, char* event_name){
+  if (!proc) {
+    logger_log(logger, LOG_LEVEL_WARN, "PCB null in lifetime_event_log");
+    return;
+  }
+  logger_log(logger, LOG_LEVEL_INFO, "\t[%4d]\t%-7s\t%d\t%d\t%s",
+    clock_tick, (event_name) ? event_name : "", proc->pid, proc->priority, (proc->process_name) ? proc->process_name : "?");
+}
+
+/**
  * Helper function to find the first occurence of pcb_ptr in a Vec and remove it if found
  * @return true if found and removed; false if not found
  */
@@ -1046,6 +1072,7 @@ void k_proc_cleanup(pcb_t* proc) {
   
   // remove the pcb from all_prcs, which will automatically destruct the PCB
   pid_t my_pid = proc->pid;
+  lifetime_event_log(proc, "WAITED");
   logger_log(logger, LOG_LEVEL_DEBUG, "Setting all_prcs for PID %d to NULL", my_pid);
   set_pcb_at_pid(my_pid, NULL);
 
@@ -1148,10 +1175,14 @@ void k_exit(void) {
   assert_non_null(self_pcb, "PCB not found in k_exit");
   logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] running k_exit", self_pcb->pid);
 
+  lifetime_event_log(self_pcb, "EXITED");
+
   // add self to parent's waitable children
   if (self_pcb->parent) {
     vec_push_back(&(self_pcb->parent->waitable_children), self_pcb);
   }
+
+  lifetime_event_log(self_pcb, "ZOMBIE");
 
   // have INIT adopt all children (and waitable children)
   logger_log(logger, LOG_LEVEL_DEBUG,
