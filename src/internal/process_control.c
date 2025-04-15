@@ -70,14 +70,29 @@ struct pcb_t {
   signal_t pending_signals;
 };
 
+/**
+ * The struct is used to pass the original func and args to the exit wrapper
+ */
 typedef struct routine_exit_wrapper_args_t {
   void* (*func)(void*);
   void* arg;
 } routine_exit_wrapper_args_t;
 
+/**
+ * The struct is used to pass the original func and args of the starting shell to INIT
+ */
+typedef struct starting_shell_args_t {
+  void* (*shell_func)(void*);
+  void* shell_arg;
+  pcb_t* init_pcb;
+} starting_shell_args_t;
+
 /********************
  * static variables *
  ********************/
+
+// the flag for checking if the kernel has started, before the attempt to create other process
+bool kernel_started = false;
 
 // the flag to indicate that the scheduler should be shut down
 bool shutdown;
@@ -130,10 +145,11 @@ static Logger* logger = NULL;
  ********************/
 
 static void process_control_initialize();
-static void create_init();
-static void* init_routine(void* arg);
+static void create_init(void* (*starting_shell_func)(void*), void* starting_shell_arg);
 static void process_control_cleanup();
 static void examine_blocked_processes();
+
+static void* init_routine(void* arg);
 
 static pcb_t* get_pcb_at_pid(pid_t pid);
 static void set_pcb_at_pid(pid_t pid, pcb_t* pcb_ptr);
@@ -141,7 +157,7 @@ static pid_t get_new_pid();
 static pcb_t* create_pcb(pid_t pid, pcb_t* parent);
 static void clean_up_pcb(void* pcb_void_ptr);
 static pcb_t* get_pcb_by_spthread (spthread_t spthread);
-static void set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), char* argv[], bool wrap_exit);
+static void set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), void* arg, bool wrap_exit);
 static bool check_blocked_waiting_child(pcb_t* pcb);
 
 static void init_adopt_children(pcb_t* pcb);
@@ -183,7 +199,7 @@ static void process_control_initialize() {
     "Error init mutex in process_control_initialize");
 
   clock_tick = 0;
-  last_pid = 0;
+  last_pid = INIT_PID;              // reserve for INIT
 
   // initialize the process lists
   // pcb will be cleaned up only when removing a process from all_prcs
@@ -208,20 +224,26 @@ static void process_control_initialize() {
 
 /**
  * Create the INIT process
+ * Reads in the starting shell function and its arg, create a new process with it and run.
+ * Then continously wait for children until see the starting shell returns
  */
-static void create_init() {
+static void create_init(void* (*starting_shell_func)(void*), void* starting_shell_arg){
   static bool init_created = false;
   if (init_created) {
     return;
   }
 
-  process_control_initialize();
-
   pcb_t* pcb_ptr = create_pcb(INIT_PID, NULL);
   assert_non_null(pcb_ptr, "pcb_ptr null in create_init");
 
   set_pcb_at_pid(INIT_PID, pcb_ptr);
-  set_routine_and_run_helper(pcb_ptr, init_routine, NULL, false);
+
+
+  starting_shell_args_t* args_to_init = malloc(sizeof(starting_shell_args_t));
+  args_to_init->shell_func = starting_shell_func;
+  args_to_init->shell_arg = starting_shell_arg;
+  args_to_init->init_pcb = pcb_ptr;
+  set_routine_and_run_helper(pcb_ptr, init_routine, args_to_init, false);
 
   init_created = true;
   logger_log(logger, LOG_LEVEL_DEBUG, "create_init completed");
@@ -232,8 +254,32 @@ static void create_init() {
  */
 
 static void* init_routine(void* arg) {
-  // TODO
-  logger_log(logger, LOG_LEVEL_DEBUG, "INIT started");
+  logger_log(logger, LOG_LEVEL_DEBUG, "INIT routine started");
+
+  assert_non_null(arg, "Arg null for init_routine");
+  starting_shell_args_t* args_to_init = (starting_shell_args_t*) arg;
+
+  pcb_t* starting_shell_pcb = create_pcb(get_new_pid(), args_to_init->init_pcb);
+  assert_non_null(starting_shell_pcb, "Created shell PCB is null in init_routine");
+  
+  const pid_t starting_shell_pid = starting_shell_pcb->pid;
+  set_pcb_at_pid(starting_shell_pid, starting_shell_pcb);
+  set_routine_and_run_helper(starting_shell_pcb, args_to_init->shell_func, args_to_init->shell_arg, true);
+
+  free(arg);
+
+  while (true) {
+    pid_t waited_pid = k_waitpid(-1, NULL, false);
+    if (waited_pid == starting_shell_pid) {
+      logger_log(logger, LOG_LEVEL_INFO, "INIT has waited starting shell, will trigger shutdown");
+      break;
+    }
+  }
+
+  logger_log(logger, LOG_LEVEL_DEBUG, "INIT triggering shutdown");
+  k_shutdown();
+
+  logger_log(logger, LOG_LEVEL_DEBUG, "INIT routine completed");
   return NULL;
 }
 
@@ -476,7 +522,7 @@ static void clean_up_pcb(void* pcb_void_ptr) {
   // ?? anything cleanup needed for spthread?
 
   if (!pcb_void_ptr) {
-    logger_log(logger, LOG_LEVEL_WARN, "clean_up_pcb called on null");
+    logger_log(logger, LOG_LEVEL_DEBUG, "clean_up_pcb called on null");
     return;
   }
 
@@ -544,7 +590,7 @@ static routine_exit_wrapper_args_t* wrap_routine_exit_args(void* (*func)(void*),
 /**
  * A helper function for k_set_routine_and_run
  */
-static void set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), char* argv[], bool wrap_exit) {
+static void set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), void* arg, bool wrap_exit) {
   if (!proc) {
     logger_log(logger, LOG_LEVEL_ERROR, "pcb ptr is NULL for k_set_routine_and_run");
     return;
@@ -558,10 +604,10 @@ static void set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), char* 
   int create_status;
 
   if (wrap_exit) {
-    routine_exit_wrapper_args_t* wrapped_args = wrap_routine_exit_args(func, argv);
+    routine_exit_wrapper_args_t* wrapped_args = wrap_routine_exit_args(func, arg);
     create_status = spthread_create(&(proc->spthread), NULL, routine_exit_wrapper_func, wrapped_args);
   } else {
-    create_status = spthread_create(&(proc->spthread), NULL, func, argv);
+    create_status = spthread_create(&(proc->spthread), NULL, func, arg);
   }
   assert_non_negative(create_status, "spthread create error");
 
@@ -780,7 +826,6 @@ static int remove_pcb_all_from_vec(pcb_t* pcb_ptr, Vec* vec) {
   scheduler_started = true;
 
   logger_log(logger, LOG_LEVEL_DEBUG, "start k_scheduler");
-  create_init();
 
   // mask for while scheduler is waiting for alarm to go off
   // block all other signals
@@ -865,12 +910,29 @@ static int remove_pcb_all_from_vec(pcb_t* pcb_ptr, Vec* vec) {
     }
 
   }
+  
+  logger_log(logger, LOG_LEVEL_DEBUG, "scheduler concludes");
+}
+
+void k_kernel_start(void* (*starting_shell)(void*), void* arg) {
+  // initialize the static variables of this module
+  process_control_initialize();
+
+  // create init process, which will create the starting shell
+  create_init(starting_shell, arg);
+  kernel_started = true;
+
+  // start scheduler
+  k_scheduler();
 
   process_control_cleanup();
 }
 
 pcb_t* k_proc_create(pcb_t* parent) {
-  create_init();
+  if (!kernel_started) {
+    logger_log(logger, LOG_LEVEL_ERROR, "Failed k_proc_create: Kernel has not started");
+    return NULL;
+  }
 
   pcb_t* pcb_ptr = NULL;
 
@@ -891,8 +953,8 @@ pcb_t* k_proc_create(pcb_t* parent) {
   return pcb_ptr;
 }
 
-void k_set_routine_and_run(pcb_t* proc, void* (*func)(void*), char* argv[]) {
-  set_routine_and_run_helper(proc, func, argv, true);
+void k_set_routine_and_run(pcb_t* proc, void* (*func)(void*), void* arg) {
+  set_routine_and_run_helper(proc, func, arg, true);
 }
 
 void k_proc_cleanup(pcb_t* proc) {

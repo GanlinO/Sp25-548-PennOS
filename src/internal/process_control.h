@@ -14,18 +14,27 @@ typedef struct pcb_t pcb_t;
 void k_scheduler();
 
 /**
+ * @brief The entry point of the process control module. The OS should call this to start
+ * the kernel, set up the starting shell to be born by INIT, and start the scheduler, and have
+ * the shell running in a separate process.
+ * This function does not return until the shutdown of the kernel. * 
+ */
+void k_kernel_start(void* (*starting_shell)(void*), void* argv);
+
+/**
  * @brief Create a new child process, inheriting applicable properties from the
  * parent.
  * @param if parent is NULL, will be regarded as child of INIT
  *
  * @return Reference to the child PCB. May return NULL if error occurs.
+ * @note make sure kernel has started before this is called
  */
 pcb_t* k_proc_create(pcb_t* parent);
 
 /**
  * @brief Create spthread with the given routine func and put it for schedule
  */
-void k_set_routine_and_run(pcb_t* proc, void* (*func)(void*), char* argv[]);
+void k_set_routine_and_run(pcb_t* proc, void* (*func)(void*), void* arg);
 
 /**
  * @brief Clean up a terminated/finished thread's resources.

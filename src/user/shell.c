@@ -80,6 +80,8 @@ void* shell_main(void* arg) {
 
   free(buf);
 
+  fprintf(stderr, "Shell exits\n");
+
   return NULL;
 }
 

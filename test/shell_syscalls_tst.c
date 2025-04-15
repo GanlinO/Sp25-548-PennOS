@@ -5,13 +5,11 @@
 int main() {
   // pseudo PennOS
 
-  Logger* logger = logger_init_stderr(LOG_LEVEL_DEBUG, "PROCESS CONTROL TEST");
-  logger_log(logger, LOG_LEVEL_DEBUG, "start");
+  Logger* logger = logger_init_stderr(LOG_LEVEL_INFO, "PROCESS CONTROL TEST");
+  logger_log(logger, LOG_LEVEL_INFO, "start");
   k_set_logger(logger);
 
-  k_set_routine_and_run(k_proc_create(NULL), shell_main, NULL);
-
-  k_scheduler();
+  k_kernel_start(shell_main, NULL);
 
   fprintf(stderr, "END\n");
 }
