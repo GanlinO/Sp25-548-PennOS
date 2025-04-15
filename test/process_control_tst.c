@@ -50,9 +50,7 @@ int main() {
   logger_log(logger, LOG_LEVEL_DEBUG, "start");
   k_set_logger(logger);
 
-  k_set_routine_and_run(k_proc_create(NULL), func2, NULL);
-
-  k_scheduler();
+  k_kernel_start(func2, NULL);
 
   fprintf(stderr, "END\n");
 }

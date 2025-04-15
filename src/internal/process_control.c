@@ -144,6 +144,8 @@ static Logger* logger = NULL;
  * declaration of internal and helper functions *
  ********************/
 
+static void kernel_scheduler();
+
 static void process_control_initialize();
 static void create_init(void* (*starting_shell_func)(void*), void* starting_shell_arg);
 static void process_control_cleanup();
@@ -159,6 +161,7 @@ static void clean_up_pcb(void* pcb_void_ptr);
 static pcb_t* get_pcb_by_spthread (spthread_t spthread);
 static void set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), void* arg, bool wrap_exit);
 static bool check_blocked_waiting_child(pcb_t* pcb);
+static schedule_priority scheduler_get_next_priority();
 
 static void init_adopt_children(pcb_t* pcb);
 static void register_blocked_state(pcb_t* pcb);
@@ -184,6 +187,109 @@ static void alarm_handler(int signum) {}
 /********************
  * internal functions *
  ********************/
+
+/**
+ * @brief The scheduler main logic
+ * It should be run by the main thread of PennOS to periodically schedule processes to run
+ */
+static void kernel_scheduler() {
+  // the scheduler should not be called another time
+  static bool scheduler_started = false;
+  if (scheduler_started) {
+    logger_log(logger, LOG_LEVEL_WARN, "kernel_scheduler already run before");
+    return;
+  }
+  scheduler_started = true;
+
+  logger_log(logger, LOG_LEVEL_DEBUG, "start kernel_scheduler");
+
+  // mask for while scheduler is waiting for alarm to go off
+  // block all other signals
+  sigset_t suspend_set;
+  sigfillset(&suspend_set);
+  sigdelset(&suspend_set, SIGALRM);
+
+  // register an empty handler so that default disposition is overridden
+  struct sigaction act = (struct sigaction){
+      .sa_handler = alarm_handler,
+      .sa_mask = suspend_set,
+      .sa_flags = SA_RESTART,
+  };
+  sigaction(SIGALRM, &act, NULL);
+
+  // make sure SIGALRM is unblocked
+  sigset_t alarm_set;
+  sigemptyset(&alarm_set);
+  sigaddset(&alarm_set, SIGALRM);
+  pthread_sigmask(SIG_UNBLOCK, &alarm_set, NULL);
+
+  struct itimerval it;
+  it.it_interval = (struct timeval){
+    .tv_sec = CLOCK_TICK_IN_USEC / SECOND_IN_USEC,
+    .tv_usec = CLOCK_TICK_IN_USEC % SECOND_IN_USEC
+  };
+  it.it_value = it.it_interval;
+  setitimer(ITIMER_REAL, &it, NULL);
+
+  schedule_priority next_priority = scheduler_get_next_priority();
+
+  assert_non_negative(pthread_mutex_lock(&shutdown_mtx), "Mutex lock error in kernel_scheduler");
+  while (!shutdown) {
+    assert_non_negative(pthread_mutex_unlock(&shutdown_mtx), "Mutex unlock error in kernel_scheduler");
+    if (vec_len(&ready_prcs_queues[next_priority]) != 0) {
+      // picked ready queue is not empty
+      pcb_t* pcb_next_run = (pcb_t*) vec_get(&ready_prcs_queues[next_priority], 0);
+      vec_erase(&ready_prcs_queues[next_priority], 0);
+      if (!pcb_next_run) {
+        logger_log(logger, LOG_LEVEL_ERROR, "PCB null found in queue[%d] in kernel_scheduler", next_priority);
+        continue;
+      }
+
+      logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] (priority %d) picked to run by scheduler",
+        pcb_next_run->pid, next_priority);
+
+      spthread_continue(pcb_next_run->spthread);
+      sigsuspend(&suspend_set);
+      ++clock_tick;
+      spthread_suspend(pcb_next_run->spthread);
+
+      // register async keyboard signals
+      // TODO
+      // process signals during this quantum
+      // TODO
+      // examine blocked processes
+      examine_blocked_processes();
+
+      if (pcb_next_run->state == PROCESS_STATE_READY) {
+        vec_push_back(&ready_prcs_queues[pcb_next_run->priority], pcb_next_run);
+      }
+
+      next_priority = scheduler_get_next_priority();
+
+    } else if (vec_len(&ready_prcs_queues[PRIORITY_1]) == 0 && vec_len(&ready_prcs_queues[PRIORITY_2]) == 0
+          && vec_len(&ready_prcs_queues[PRIORITY_3]) == 0) {
+      // all ready queue is empty
+      logger_log(logger, LOG_LEVEL_DEBUG, "All queue empty!", next_priority);
+      sigsuspend(&suspend_set);
+      ++clock_tick;
+
+      // register async keyboard signals
+      // TODO
+      // process signals during this quantum
+      // TODO
+      // examine blocked processes
+      examine_blocked_processes();
+
+    } else {
+      logger_log(logger, LOG_LEVEL_DEBUG, "Queue[%d] empty so pass", next_priority);
+      next_priority = scheduler_get_next_priority();
+    }
+
+  }
+  
+  logger_log(logger, LOG_LEVEL_DEBUG, "kernel_scheduler concludes");
+}
+
 /**
  * Initialize the process control module if not yet initialized
  * @note does nothing when called again after the first time (has a flag the record whether
@@ -816,104 +922,6 @@ static int remove_pcb_all_from_vec(pcb_t* pcb_ptr, Vec* vec) {
  * public functions *
  ********************/
 
- void k_scheduler() {
-  // the scheduler should not be called another time
-  static bool scheduler_started = false;
-  if (scheduler_started) {
-    logger_log(logger, LOG_LEVEL_WARN, "k_scheduler already run before");
-    return;
-  }
-  scheduler_started = true;
-
-  logger_log(logger, LOG_LEVEL_DEBUG, "start k_scheduler");
-
-  // mask for while scheduler is waiting for alarm to go off
-  // block all other signals
-  sigset_t suspend_set;
-  sigfillset(&suspend_set);
-  sigdelset(&suspend_set, SIGALRM);
-
-  // register an empty handler so that default disposition is overridden
-  struct sigaction act = (struct sigaction){
-      .sa_handler = alarm_handler,
-      .sa_mask = suspend_set,
-      .sa_flags = SA_RESTART,
-  };
-  sigaction(SIGALRM, &act, NULL);
-
-  // make sure SIGALRM is unblocked
-  sigset_t alarm_set;
-  sigemptyset(&alarm_set);
-  sigaddset(&alarm_set, SIGALRM);
-  pthread_sigmask(SIG_UNBLOCK, &alarm_set, NULL);
-
-  struct itimerval it;
-  it.it_interval = (struct timeval){
-    .tv_sec = CLOCK_TICK_IN_USEC / SECOND_IN_USEC,
-    .tv_usec = CLOCK_TICK_IN_USEC % SECOND_IN_USEC
-  };
-  it.it_value = it.it_interval;
-  setitimer(ITIMER_REAL, &it, NULL);
-
-  schedule_priority next_priority = scheduler_get_next_priority();
-
-  assert_non_negative(pthread_mutex_lock(&shutdown_mtx), "Mutex lock error in k_scheduler");
-  while (!shutdown) {
-    assert_non_negative(pthread_mutex_unlock(&shutdown_mtx), "Mutex unlock error in k_scheduler");
-    if (vec_len(&ready_prcs_queues[next_priority]) != 0) {
-      // picked ready queue is not empty
-      pcb_t* pcb_next_run = (pcb_t*) vec_get(&ready_prcs_queues[next_priority], 0);
-      vec_erase(&ready_prcs_queues[next_priority], 0);
-      if (!pcb_next_run) {
-        logger_log(logger, LOG_LEVEL_ERROR, "PCB null found in queue[%d] in k_scheduler", next_priority);
-        continue;
-      }
-
-      logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] (priority %d) picked to run by scheduler",
-        pcb_next_run->pid, next_priority);
-
-      spthread_continue(pcb_next_run->spthread);
-      sigsuspend(&suspend_set);
-      ++clock_tick;
-      spthread_suspend(pcb_next_run->spthread);
-
-      // register async keyboard signals
-      // TODO
-      // process signals during this quantum
-      // TODO
-      // examine blocked processes
-      examine_blocked_processes();
-
-      if (pcb_next_run->state == PROCESS_STATE_READY) {
-        vec_push_back(&ready_prcs_queues[pcb_next_run->priority], pcb_next_run);
-      }
-
-      next_priority = scheduler_get_next_priority();
-
-    } else if (vec_len(&ready_prcs_queues[PRIORITY_1]) == 0 && vec_len(&ready_prcs_queues[PRIORITY_2]) == 0
-          && vec_len(&ready_prcs_queues[PRIORITY_3]) == 0) {
-      // all ready queue is empty
-      logger_log(logger, LOG_LEVEL_DEBUG, "All queue empty!", next_priority);
-      sigsuspend(&suspend_set);
-      ++clock_tick;
-
-      // register async keyboard signals
-      // TODO
-      // process signals during this quantum
-      // TODO
-      // examine blocked processes
-      examine_blocked_processes();
-
-    } else {
-      logger_log(logger, LOG_LEVEL_DEBUG, "Queue[%d] empty so pass", next_priority);
-      next_priority = scheduler_get_next_priority();
-    }
-
-  }
-  
-  logger_log(logger, LOG_LEVEL_DEBUG, "scheduler concludes");
-}
-
 void k_kernel_start(void* (*starting_shell)(void*), void* arg) {
   // initialize the static variables of this module
   process_control_initialize();
@@ -923,7 +931,7 @@ void k_kernel_start(void* (*starting_shell)(void*), void* arg) {
   kernel_started = true;
 
   // start scheduler
-  k_scheduler();
+  kernel_scheduler();
 
   process_control_cleanup();
 }

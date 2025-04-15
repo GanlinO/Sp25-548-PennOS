@@ -8,12 +8,6 @@
 typedef struct pcb_t pcb_t;
 
 /**
- * @brief The scheduler main logic
- * It should be run by the main thread of PennOS to periodically schedule processes to run
- */
-void k_scheduler();
-
-/**
  * @brief The entry point of the process control module. The OS should call this to start
  * the kernel, set up the starting shell to be born by INIT, and start the scheduler, and have
  * the shell running in a separate process.
