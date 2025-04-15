@@ -298,7 +298,7 @@ static void kernel_scheduler() {
 
   }
   
-  logger_log(logger, LOG_LEVEL_DEBUG, "kernel_scheduler concludes");
+  logger_log(logger, LOG_LEVEL_INFO, "kernel_scheduler concludes");
 }
 
 /**
@@ -394,7 +394,7 @@ static void* init_routine(void* arg) {
   while (true) {
     pid_t waited_pid = k_waitpid(-1, NULL, false);
     if (waited_pid == starting_shell_pid) {
-      logger_log(logger, LOG_LEVEL_INFO, "INIT has waited starting shell, will trigger shutdown");
+      logger_log(logger, LOG_LEVEL_INFO, "INIT has waited shell, will trigger shutdown");
       break;
     }
   }
@@ -438,6 +438,7 @@ static void process_control_cleanup() {
 
   logger_log(logger, LOG_LEVEL_DEBUG, "process_control_cleanup completed");
 
+  logger_log(logger, LOG_LEVEL_DEBUG, "Closing logger");
   logger_close(logger);  
 
 }
