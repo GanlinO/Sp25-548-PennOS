@@ -246,16 +246,18 @@ static void kernel_scheduler() {
   assert_non_negative(pthread_mutex_lock(&shutdown_mtx), "Mutex lock error in kernel_scheduler");
   while (!shutdown) {
     assert_non_negative(pthread_mutex_unlock(&shutdown_mtx), "Mutex unlock error in kernel_scheduler");
+
     if (vec_len(&ready_prcs_queues[next_priority]) != 0) {
       // picked ready queue is not empty
+
       pcb_t* pcb_next_run = (pcb_t*) vec_get(&ready_prcs_queues[next_priority], 0);
       vec_erase(&ready_prcs_queues[next_priority], 0);
       if (!pcb_next_run) {
-        logger_log(logger, LOG_LEVEL_ERROR, "PCB null found in queue[%d] in kernel_scheduler", next_priority);
+        logger_log(logger, LOG_LEVEL_ERROR, "PCB null found in ready queue[%d] in kernel_scheduler", next_priority);
         continue;
       }
 
-      logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] (priority %d) picked to run by scheduler",
+      logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] popped from ready queue[%d], picked to run by scheduler",
         pcb_next_run->pid, next_priority);
       schedule_event_log(pcb_next_run, next_priority);
 
@@ -264,35 +266,46 @@ static void kernel_scheduler() {
       ++clock_tick;
       spthread_suspend(pcb_next_run->spthread);
 
+      logger_log(logger, LOG_LEVEL_DEBUG, "Time quantum end for PID [%d]",
+        pcb_next_run->pid);
+
       // register async keyboard signals
       // TODO
-      // process signals during this quantum
+      // handle signals received during this quantum
       // TODO
-      // examine blocked processes
-      examine_blocked_processes();
 
+      // re-adding ready process to the back of the queue
+      // note that this have to be done before examine_blocked_processes() (unblocking processes) to handle
+      // the edge case where the last running process become blocked and then unblocked (e.g. sleep(1))
       if (pcb_next_run->state == PROCESS_STATE_READY) {
         vec_push_back(&ready_prcs_queues[pcb_next_run->priority], pcb_next_run);
+        logger_log(logger, LOG_LEVEL_DEBUG, "PID [%d] used quantum and re-added to ready queue[%d] in scheduler",
+          pcb_next_run->pid, pcb_next_run->priority);
       }
+
+      // examine blocked processes and put back into ready queue those unblocked 
+      // (sleep expires or waitpid got waited child)
+      examine_blocked_processes();
 
       next_priority = scheduler_get_next_priority();
 
     } else if (vec_len(&ready_prcs_queues[PRIORITY_1]) == 0 && vec_len(&ready_prcs_queues[PRIORITY_2]) == 0
           && vec_len(&ready_prcs_queues[PRIORITY_3]) == 0) {
       // all ready queue is empty
-      logger_log(logger, LOG_LEVEL_DEBUG, "All queue empty!", next_priority);
+      logger_log(logger, LOG_LEVEL_DEBUG, "All ready queues empty!", next_priority);
       sigsuspend(&suspend_set);
       ++clock_tick;
 
       // register async keyboard signals
       // TODO
-      // process signals during this quantum
+      // handle signals received during this quantum
       // TODO
-      // examine blocked processes
+      // examine blocked processes and put back into ready queue those unblocked 
+      // (sleep expires or waitpid got waited child)
       examine_blocked_processes();
 
     } else {
-      logger_log(logger, LOG_LEVEL_DEBUG, "Queue[%d] empty so pass", next_priority);
+      logger_log(logger, LOG_LEVEL_DEBUG, "ready queue[%d] empty so pass", next_priority);
       next_priority = scheduler_get_next_priority();
     }
 
@@ -445,6 +458,7 @@ static void process_control_cleanup() {
 
 /**
  * Examine the current blocked processes and unblock those with block condition not longer holds
+ * 
  */
 static void examine_blocked_processes() {
   size_t index = 0;
@@ -493,7 +507,7 @@ static void examine_blocked_processes() {
     if (proc->state == PROCESS_STATE_BLOCKED) {
       proc->state = PROCESS_STATE_READY;
       vec_push_back(&ready_prcs_queues[proc->priority], proc);
-      logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] unblocks and ready for schedule", proc->pid);
+      logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] unblocks and ready for schedule (put into ready queue[%d])", proc->pid, proc->priority);
     } else {
       logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] unblocks but still stopped", proc->pid);
     }
@@ -760,6 +774,7 @@ static void set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), void* 
 
   proc->state = PROCESS_STATE_READY;
   vec_push_back(&ready_prcs_queues[proc->priority], proc);
+  logger_log(logger, LOG_LEVEL_DEBUG, "PID [%d] added to ready queue[%d] in set_routine_and_run_helper", proc->pid, proc->priority);
 
   lifecycle_event_log(proc, "CREATED", NULL);
 }
@@ -856,9 +871,9 @@ static void register_blocked_state(pcb_t* pcb) {
   if (pcb->state == PROCESS_STATE_READY) {
     pcb->state = PROCESS_STATE_BLOCKED;
 
-    // this is usually not needed as the running process is not in ready queue
+    // this should not be needed as the running process is not in ready queue
     if (remove_pcb_first_from_vec(pcb, &ready_prcs_queues[pcb->priority])) {
-      logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] removed from ready queue[%d]", pcb->pid, pcb->priority);
+      logger_log(logger, LOG_LEVEL_WARN, "PID[%d] removed from ready queue[%d] (existing unexpectedly) in register_blocked_state", pcb->pid, pcb->priority);
     }
     
   }
