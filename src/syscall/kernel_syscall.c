@@ -3,6 +3,10 @@
 #include "../util/utils.h"
 
 pid_t s_spawn(void* (*func)(void*), char* argv[], int fd0, int fd1) {
+  if (func == NULL) {
+    return -1;                 // invalid argument
+  }
+
   pcb_t* my_pcb_ptr = k_get_self_pcb();
   // TODO: return -1 and set errno instead?
   assert_non_null(my_pcb_ptr, "Self PCB not found in s_spawn");
@@ -13,9 +17,13 @@ pid_t s_spawn(void* (*func)(void*), char* argv[], int fd0, int fd1) {
 
   // TODO: update fd0 and fd1 for child
 
-  k_set_routine_and_run(child_pcb_ptr, func, argv);
-  // TODO: handle situation where k_set_routine_and_run may fail
-  // TODO: set error number for ret -1
+  int set_routine_status = k_set_routine_and_run(child_pcb_ptr, func, argv);
+  if (set_routine_status < 0) {
+    // -1 for failed spthread creation, -2 for invalid argument (which should already be ruled out)
+    k_proc_cleanup(child_pcb_ptr);
+    return -1; 
+    // TODO: set error number
+  }
 
   pid_t child_pid = k_get_pid(child_pcb_ptr);
   if (child_pid <= 0) {

@@ -170,7 +170,7 @@ static pid_t get_new_pid();
 static pcb_t* create_pcb(pid_t pid, pcb_t* parent);
 static void clean_up_pcb(void* pcb_void_ptr);
 static pcb_t* get_pcb_by_spthread (spthread_t spthread);
-static void set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), void* arg, bool wrap_exit);
+static int set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), void* arg, bool wrap_exit);
 static bool check_blocked_waiting_child(pcb_t* pcb);
 static schedule_priority scheduler_get_next_priority();
 static void set_process_name(pcb_t* pcb, const char* process_name);
@@ -748,15 +748,15 @@ static routine_exit_wrapper_args_t* wrap_routine_exit_args(void* (*func)(void*),
 /**
  * A helper function for k_set_routine_and_run
  */
-static void set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), void* arg, bool wrap_exit) {
+static int set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), void* arg, bool wrap_exit) {
   if (!proc) {
     logger_log(logger, LOG_LEVEL_ERROR, "pcb ptr is NULL for k_set_routine_and_run");
-    return;
+    return -2;
   }
 
   if (!func) {
     logger_log(logger, LOG_LEVEL_ERROR, "func is NULL for k_set_routine_and_run");
-    return;
+    return -2;
   }
 
   // CREATE SPTHREAD
@@ -768,8 +768,12 @@ static void set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), void* 
   } else {
     create_status = spthread_create(&(proc->spthread), NULL, func, arg);
   }
-  assert_non_negative(create_status, "spthread create error");
 
+  if (create_status < 0) {
+    logger_log(logger, LOG_LEVEL_ERROR, "Spthread creation error for PID[%d]", proc->pid);
+    proc->state = PROCESS_STATE_TERMINATED;
+    return -1;
+  }
   logger_log(logger, LOG_LEVEL_DEBUG, "Spthread created with thd routine for PID[%d]", proc->pid);
 
   // SET UP PROCESS NAME
@@ -791,6 +795,8 @@ static void set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), void* 
   logger_log(logger, LOG_LEVEL_DEBUG, "PID [%d] added to ready queue[%d] in set_routine_and_run_helper", proc->pid, proc->priority);
 
   lifecycle_event_log(proc, "CREATED", NULL);
+
+  return 0;
 }
 
 /** Helper function to check whether the process should still block
@@ -1081,8 +1087,8 @@ pcb_t* k_proc_create(pcb_t* parent) {
   return pcb_ptr;
 }
 
-void k_set_routine_and_run(pcb_t* proc, void* (*func)(void*), void* arg) {
-  set_routine_and_run_helper(proc, func, arg, true);
+int k_set_routine_and_run(pcb_t* proc, void* (*func)(void*), void* arg) {
+  return set_routine_and_run_helper(proc, func, arg, true);
 }
 
 void k_proc_cleanup(pcb_t* proc) {
@@ -1095,13 +1101,16 @@ void k_proc_cleanup(pcb_t* proc) {
   spthread_cancel_and_join(proc->spthread);
 
   pcb_t* parent_pcb = proc->parent;
-  assert_non_null(parent_pcb, "Parent PCB null in k_proc_cleanup");
-  
-  // remove from parent's child vec
-  // assume waitable children has been cleaned up
-  if (!remove_pcb_first_from_vec(proc, &parent_pcb->children)) {
-    logger_log(logger, LOG_LEVEL_WARN, "Cannot find reaped child in k_waitpid");
-  }
+  if (parent_pcb) {
+    // remove from parent's child vec
+    // assume waitable children has been cleaned up when it becomes zombie
+    if (!remove_pcb_first_from_vec(proc, &parent_pcb->children)) {
+      logger_log(logger, LOG_LEVEL_WARN, "Cannot find reaped child in k_waitpid");
+    }
+  } else {
+    logger_log(logger, LOG_LEVEL_WARN, "Parent PCB null in k_proc_cleanup");
+  }  
+
   // double check whether all children has gone (been adopted previously)
   if (vec_len(&proc->children) > 0 || vec_len(&proc->waitable_children) > 0) {
     logger_log(logger, LOG_LEVEL_WARN, "Unadopted orphan found in k_waitpid");

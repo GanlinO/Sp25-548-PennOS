@@ -81,6 +81,7 @@ void* shell_main(void* arg) {
     pid_t child_pid = process_one_command(cmd->commands[0]);
 
     if (child_pid <= 0) {
+      // no need to wait or record job if there is no new process
       continue;
     }
 

@@ -27,8 +27,9 @@ pcb_t* k_proc_create(pcb_t* parent);
 
 /**
  * @brief Create spthread with the given routine func and put it for schedule
+ * @return 0 on success, -2 on invalid arguments, -1 on failed spthread creation
  */
-void k_set_routine_and_run(pcb_t* proc, void* (*func)(void*), void* arg);
+int k_set_routine_and_run(pcb_t* proc, void* (*func)(void*), void* arg);
 
 /**
  * @brief Clean up a terminated/finished thread's resources.

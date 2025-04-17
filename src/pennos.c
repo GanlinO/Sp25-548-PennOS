@@ -1,5 +1,4 @@
 #include "internal/process_control.h"
-#include "syscall/kernel_syscall.h"
 #include "user/shell.h"
 
 int main(int argc, char *argv[]) {
