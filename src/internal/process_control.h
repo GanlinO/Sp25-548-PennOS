@@ -52,6 +52,15 @@ void k_proc_cleanup(pcb_t* proc);
 pid_t k_waitpid(pid_t pid, int* wstatus, bool nohang);
 
 /**
+ * @brief Set the priority of the specified thread.
+ *
+ * @param pid Process ID of the target thread.
+ * @param priority The new priorty value of the thread (0, 1, or 2)
+ * @return 0 on success, -1 on failure.
+ */
+int k_nice(pid_t pid, int priority);
+
+/**
  * @brief Suspends execution of the calling proces for a specified number of
  * clock ticks.
  *
@@ -81,6 +90,10 @@ void k_shutdown(void);
  */
 pcb_t* k_get_self_pcb();
 
+/**
+ * Get the PID for a PCB pointer
+ * @return PID of the PCB pointed to. If pcb_ptr is null, return -1.
+ */
 pid_t k_get_pid(pcb_t* pcb_ptr);
 
 /**

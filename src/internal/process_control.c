@@ -98,17 +98,22 @@ typedef struct starting_shell_args_t {
  ********************/
 
 // the flag for checking if the kernel has started, before the attempt to create other process
-bool kernel_started = false;
+static bool kernel_started = false;
 
 // the flag to indicate that the scheduler should be shut down
-bool shutdown;
+static bool shutdown;
 // the mutex to protect shutdown
-pthread_mutex_t shutdown_mtx;
+static pthread_mutex_t shutdown_mtx;
 
-clock_tick_t clock_tick;
+// maintain the clock tick value
+static clock_tick_t clock_tick;
 
 // the pid handed out most recently
 static pid_t last_pid;
+
+// pcb pointer to the process currently running (or, during scheduling, the process running 
+// in the last quantum). May be set to null during some part of the scheduling (quantum gap).
+static pcb_t* running_prc;
 
 // list of all processes (pcb_ptr*) with index exactly PID - 1
 // this can help get the PCB pointer of a certain PID
@@ -250,24 +255,24 @@ static void kernel_scheduler() {
     if (vec_len(&ready_prcs_queues[next_priority]) != 0) {
       // picked ready queue is not empty
 
-      pcb_t* pcb_next_run = (pcb_t*) vec_get(&ready_prcs_queues[next_priority], 0);
+      running_prc = (pcb_t*) vec_get(&ready_prcs_queues[next_priority], 0);
       vec_erase(&ready_prcs_queues[next_priority], 0);
-      if (!pcb_next_run) {
+      if (!running_prc) {
         logger_log(logger, LOG_LEVEL_ERROR, "PCB null found in ready queue[%d] in kernel_scheduler", next_priority);
         continue;
       }
 
       logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] popped from ready queue[%d], picked to run by scheduler",
-        pcb_next_run->pid, next_priority);
-      schedule_event_log(pcb_next_run, next_priority);
+        running_prc->pid, next_priority);
+      schedule_event_log(running_prc, next_priority);
 
-      spthread_continue(pcb_next_run->spthread);
+      spthread_continue(running_prc->spthread);
       sigsuspend(&suspend_set);
       ++clock_tick;
-      spthread_suspend(pcb_next_run->spthread);
+      spthread_suspend(running_prc->spthread);
 
       logger_log(logger, LOG_LEVEL_DEBUG, "Time quantum end for PID [%d]",
-        pcb_next_run->pid);
+        running_prc->pid);
 
       // register async keyboard signals
       // TODO
@@ -276,12 +281,15 @@ static void kernel_scheduler() {
 
       // re-adding ready process to the back of the queue
       // note that this have to be done before examine_blocked_processes() (unblocking processes) to handle
-      // the edge case where the last running process become blocked and then unblocked (e.g. sleep(1))
-      if (pcb_next_run->state == PROCESS_STATE_READY) {
-        vec_push_back(&ready_prcs_queues[pcb_next_run->priority], pcb_next_run);
+      // the edge case where the last running process become blocked and then unblocked (e.g. k_sleep() for 
+      // 1 clock tick), though this can also be fixed by explicitly checking for running_prc during
+      //  examine_blocked_processes()
+      if (running_prc->state == PROCESS_STATE_READY) {
+        vec_push_back(&ready_prcs_queues[running_prc->priority], running_prc);
         logger_log(logger, LOG_LEVEL_DEBUG, "PID [%d] used quantum and re-added to ready queue[%d] in scheduler",
-          pcb_next_run->pid, pcb_next_run->priority);
+          running_prc->pid, running_prc->priority);
       }
+      running_prc = NULL;
 
       // examine blocked processes and put back into ready queue those unblocked 
       // (sleep expires or waitpid got waited child)
@@ -334,6 +342,7 @@ static void process_control_initialize() {
   // initialize the process lists
   // pcb will be cleaned up only when removing a process from all_prcs
   // others will not
+  running_prc = NULL;
   all_prcs = vec_new(0, clean_up_pcb);
   blocked_prcs = vec_new(0, NULL);
   stopped_prcs = vec_new(0, NULL);
@@ -506,10 +515,15 @@ static void examine_blocked_processes() {
     // the blocking condition is lifted
     if (proc->state == PROCESS_STATE_BLOCKED) {
       proc->state = PROCESS_STATE_READY;
-      vec_push_back(&ready_prcs_queues[proc->priority], proc);
-      logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] unblocks and ready for schedule (put into ready queue[%d])", proc->pid, proc->priority);
+      if (proc != running_prc) {
+        // put into ready queue only if it is not running_prc, to avoid double-queuing 
+        // (running_prc will be added back to ready queue by scheduler after quantum finishes
+        // if its state is READY)
+        vec_push_back(&ready_prcs_queues[proc->priority], proc);
+        logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] unblocks and ready for schedule (put into ready queue[%d])", proc->pid, proc->priority);
+      }
     } else {
-      logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] unblocks but still stopped", proc->pid);
+      logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] unblocks but not ready for schedule (still stopped)", proc->pid);
     }
 
   }
@@ -745,6 +759,7 @@ static void set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), void* 
     return;
   }
 
+  // CREATE SPTHREAD
   int create_status;
 
   if (wrap_exit) {
@@ -755,9 +770,9 @@ static void set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), void* 
   }
   assert_non_negative(create_status, "spthread create error");
 
-  logger_log(logger, LOG_LEVEL_DEBUG, "Set routing started");
+  logger_log(logger, LOG_LEVEL_DEBUG, "Spthread created with thd routine for PID[%d]", proc->pid);
 
-  // set up process name
+  // SET UP PROCESS NAME
   char* process_name = NULL;
   if (proc->pid ==INIT_PID) {
     process_name = INIT_PROCESS_NAME;
@@ -767,11 +782,10 @@ static void set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), void* 
     char** argv = (char**) arg;
     process_name = argv[0];
   }
-
   set_process_name(proc, process_name);
-  
   logger_log(logger, LOG_LEVEL_DEBUG, "Process name set for PID[%d]: %s", proc->pid, proc->process_name);
 
+  // ADD TO SCHEDULING READY QUEUE
   proc->state = PROCESS_STATE_READY;
   vec_push_back(&ready_prcs_queues[proc->priority], proc);
   logger_log(logger, LOG_LEVEL_DEBUG, "PID [%d] added to ready queue[%d] in set_routine_and_run_helper", proc->pid, proc->priority);
@@ -1182,6 +1196,40 @@ pid_t k_waitpid(pid_t pid, int* wstatus, bool nohang) {
       assert_non_negative(spthread_suspend_self(), "spthread_suspend_self error in k_waitpid");
     }
   }
+}
+
+int k_nice(pid_t pid, int priority) {
+  if (priority >= PRIORITY_COUNT) {
+    // TODO: set errno?
+    return -1;
+  }
+
+  pcb_t* proc = get_pcb_at_pid(pid);
+  if (!proc) {
+    // TODO: set errno?
+    return -1;
+  }
+
+  if (remove_pcb_first_from_vec(proc, &ready_prcs_queues[proc->priority])) {
+    if (proc != running_prc) {
+      logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] removed from ready queue[%d] in k_nice", proc->pid, proc->priority);
+    } else {
+      // for debugging, should theoretically not happen
+      logger_log(logger, LOG_LEVEL_WARN, "PID[%d] removed from ready queue[%d] (exist unexpectedly as running_prc) in k_nice", proc->pid, proc->priority);
+    }
+  } else {
+    // for debugging, should theoretically not happen
+    if (proc != running_prc) {
+      logger_log(logger, LOG_LEVEL_WARN, "PID[%d] not found unexpectedly in ready queue[%d] in k_nice", proc->pid, proc->priority);
+    }
+  }
+
+  proc->priority = priority;
+  vec_push_back(&ready_prcs_queues[proc->priority], proc);
+  logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] added to ready queue[%d] in k_nice", proc->pid, proc->priority);
+
+  return 0;
+
 }
 
 void k_sleep(clock_tick_t ticks) {

@@ -146,9 +146,11 @@ void* kill(void* arg);
 
 /**
  * @brief Spawn a new process for `command` and set its priority to `priority`.
- * 2. Adjust the priority level of an existing process.
  *
  * Example Usage: nice 2 cat f1 f2 f3 (spawns cat with priority 2)
+ * @return a pid_t* which points to the pid value of the spawned process (0 if no 
+ * process is spawned, or negative number if error occurs). The return value may
+ * also be NULL.
  */
 void* u_nice(void* arg);
 

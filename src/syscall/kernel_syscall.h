@@ -12,7 +12,7 @@
  * argv[0].
  * @param fd0 Input file descriptor.
  * @param fd1 Output file descriptor.
- * @return pid_t The process ID of the created child process.
+ * @return pid_t The process ID of the created child process. Returns -1 on error.
  */
 pid_t s_spawn(void* (*func)(void*), char* argv[], int fd0, int fd1);
 

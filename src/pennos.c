@@ -11,7 +11,7 @@ int main(int argc, char *argv[]) {
   // TODO
 
   /* RUN KERNEL (incl. INIT creation, run scheduler, spawn shell) */
-  Logger* logger = logger_init_stderr(LOG_LEVEL_DEBUG, "KERNEL");
+  Logger* logger = logger_init_stderr(LOG_LEVEL_INFO, "KERNEL");
   k_set_logger(logger);
   logger_log(logger, LOG_LEVEL_INFO, "PennOS starts");
   char* args[] = {"shell", NULL};
