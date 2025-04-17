@@ -1,5 +1,5 @@
 #include "shell.h"
-#include "../syscall/kernel_syscall.h"
+#include "../syscall/syscall_kernel.h"
 #include "../util/parser.h"
 #include "../util/utils.h"
 

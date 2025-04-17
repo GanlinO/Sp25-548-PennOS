@@ -1,5 +1,5 @@
 #include "../src/internal/process_control.h"
-#include "../src/syscall/kernel_syscall.h"
+#include "../src/syscall/syscall_kernel.h"
 
 #include <unistd.h>     // for sleep()
 

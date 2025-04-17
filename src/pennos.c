@@ -1,4 +1,4 @@
-#include "internal/process_control.h"
+#include "internal/process_control.h"       // internal kernel
 #include "user/shell.h"
 
 int main(int argc, char *argv[]) {
@@ -13,6 +13,7 @@ int main(int argc, char *argv[]) {
   Logger* logger = logger_init_stderr(LOG_LEVEL_INFO, "KERNEL");
   k_set_logger(logger);
   logger_log(logger, LOG_LEVEL_INFO, "PennOS starts");
+  
   char* args[] = {"shell", NULL};
   k_kernel_start(shell_main, args);
   // this will keep running until shell shuts down, logger will also be closed

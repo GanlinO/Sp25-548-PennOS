@@ -1,5 +1,5 @@
-#ifndef KERNEL_SYSCALL_H_
-#define KERNEL_SYSCALL_H_
+#ifndef SYSCALL_KERNEL_H_
+#define SYSCALL_KERNEL_H_
 
 #include "../common/pennos_types.h"
 
@@ -75,4 +75,4 @@ void s_sleep(clock_tick_t ticks);
  */
 void s_printprocess(void);
 
-#endif  // KERNEL_SYSCALL_H_
+#endif  // SYSCALL_KERNEL_H_

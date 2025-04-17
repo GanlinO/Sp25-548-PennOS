@@ -1,4 +1,4 @@
-#include "kernel_syscall.h"
+#include "syscall_kernel.h"
 #include "../internal/process_control.h"
 #include "../util/utils.h"
 
