@@ -96,7 +96,7 @@ void logger_log(Logger* logger, LogLevel level, const char* format, ...) {
 
 void logger_close(Logger* logger) {
     if (logger) {
-        if (logger->fp) {
+        if (logger->fp && logger->fp != stderr && logger->fp != stdout) {
             fclose(logger->fp);
         }
         free(logger);
