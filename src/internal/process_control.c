@@ -1116,7 +1116,7 @@ void k_proc_cleanup(pcb_t* proc) {
 }
 
 pid_t k_waitpid(pid_t pid, int* wstatus, bool nohang) {
-  if (pid < -1) {
+  if (pid < -1 || pid == 0) {
     // TODO: set errno
     return -1;
   }
