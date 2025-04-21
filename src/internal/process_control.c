@@ -72,7 +72,7 @@ struct pcb_t {
   clock_tick_t wake_tick;
   int waitpid_stat;
   Vec fds;
-  signal_t pending_signals;
+  signalset_t pending_signals;
   char* process_name;
 };
 
@@ -108,8 +108,17 @@ static pthread_mutex_t shutdown_mtx;
 // maintain the clock tick value
 static clock_tick_t clock_tick;
 
+// flag of async SIGINT (Ctrl-C) being hit during this quantum
+static sig_atomic_t flag_sigint;
+
+// flag of async SIGTSTP (CTRL-Z) being hit during this quantum
+static sig_atomic_t flag_sigtstp;
+
 // the pid handed out most recently
 static pid_t last_pid;
+
+// pid of the process holding terminal control
+static pid_t term_ctrl_pid;
 
 // pcb pointer to the process currently running (or, during scheduling, the process running 
 // in the last quantum). May be set to null during some part of the scheduling (quantum gap).
@@ -137,12 +146,6 @@ static Vec ready_prcs_queues [PRIORITY_COUNT];
 // (removing the element does not trigger PCB clean up)
 static Vec blocked_prcs;
 
-// list of stopped processes (pcb_ptr*)
-// may also contain stopped process if it is both stopped and blocked
-// Vec is expected to initialize without element destructor function
-// (removing the element does not trigger PCB clean up)
-static Vec stopped_prcs;
-
 // list of processes with pending signals
 // Vec is expected to initialize without element destructor function
 // (removing the element does not trigger PCB clean up)
@@ -160,6 +163,8 @@ static void kernel_scheduler();
 static void process_control_initialize();
 static void create_init(void* (*starting_shell_func)(void*), void* starting_shell_arg);
 static void process_control_cleanup();
+static void register_async_signals();
+static void handle_pending_signals();
 static void examine_blocked_processes();
 
 static void* init_routine(void* arg);
@@ -174,6 +179,7 @@ static int set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), void* a
 static bool check_blocked_waiting_child(pcb_t* pcb);
 static schedule_priority scheduler_get_next_priority();
 static void set_process_name(pcb_t* pcb, const char* process_name);
+static void process_deathbed(pcb_t* proc);
 
 static void schedule_event_log(pcb_t* proc, schedule_priority priority);
 static void lifecycle_event_log(pcb_t* proc, char* event_name, char* add_msg);
@@ -198,6 +204,16 @@ static void spthread_cancel_and_join(spthread_t thread);
  * intentionally left empty 
  */
 static void alarm_handler(int signum) {}
+
+static void async_sig_handler(int signum) {
+  if (signum == SIGINT) {
+    flag_sigint = true;
+  }
+
+  if (signum == SIGTSTP) {
+    flag_sigtstp = true;
+  }
+}
 
 /********************
  * internal functions *
@@ -275,9 +291,9 @@ static void kernel_scheduler() {
         running_prc->pid);
 
       // register async keyboard signals
-      // TODO
+      register_async_signals();
       // handle signals received during this quantum
-      // TODO
+      handle_pending_signals();
 
       // re-adding ready process to the back of the queue
       // note that this have to be done before examine_blocked_processes() (unblocking processes) to handle
@@ -305,9 +321,9 @@ static void kernel_scheduler() {
       ++clock_tick;
 
       // register async keyboard signals
-      // TODO
+      register_async_signals();
       // handle signals received during this quantum
-      // TODO
+      handle_pending_signals();
       // examine blocked processes and put back into ready queue those unblocked 
       // (sleep expires or waitpid got waited child)
       examine_blocked_processes();
@@ -339,13 +355,24 @@ static void process_control_initialize() {
   clock_tick = 0;
   last_pid = INIT_PID;              // reserve for INIT
 
+  flag_sigint = false;
+  flag_sigtstp = false;
+  term_ctrl_pid = 0;
+
+  // register SIGINT and SIGTSTP handlers
+  struct sigaction act = (struct sigaction){
+    .sa_handler = async_sig_handler,
+    .sa_flags = SA_RESTART,
+  };
+  sigaction(SIGINT, &act, NULL);
+  sigaction(SIGTSTP, &act, NULL);
+
   // initialize the process lists
   // pcb will be cleaned up only when removing a process from all_prcs
   // others will not
   running_prc = NULL;
   all_prcs = vec_new(0, clean_up_pcb);
   blocked_prcs = vec_new(0, NULL);
-  stopped_prcs = vec_new(0, NULL);
   pending_sig_prcs = vec_new(0, NULL);
 
   for (schedule_priority i = PRIORITY_1; i < PRIORITY_COUNT - 1; ++i) {
@@ -398,7 +425,7 @@ static void* init_routine(void* arg) {
   assert_non_null(arg, "Arg null for init_routine");
   starting_shell_args_t* args_to_init = (starting_shell_args_t*) arg;
 
-  pcb_t* starting_shell_pcb = create_pcb(get_new_pid(), args_to_init->init_pcb);
+  pcb_t* starting_shell_pcb = create_pcb(INIT_PID + 1, args_to_init->init_pcb);
   assert_non_null(starting_shell_pcb, "Created shell PCB is null in init_routine");
 
   // the shell should be run with top priority
@@ -408,6 +435,9 @@ static void* init_routine(void* arg) {
   set_pcb_at_pid(starting_shell_pid, starting_shell_pcb);
   set_routine_and_run_helper(starting_shell_pcb, args_to_init->shell_func, args_to_init->shell_arg, true);
   free(arg);
+
+  // give shell the terminal control
+  term_ctrl_pid = INIT_PID + 1;
 
   if (strcmp(starting_shell_pcb->process_name, DEFAULT_PROCESS_NAME) == 0) {
     set_process_name(starting_shell_pcb, "SHELL");
@@ -444,7 +474,6 @@ static void process_control_cleanup() {
   }
 
   vec_destroy(&blocked_prcs);
-  vec_destroy(&stopped_prcs);
   vec_destroy(&pending_sig_prcs);
 
   for (schedule_priority i = PRIORITY_1; i < PRIORITY_COUNT - 1; ++i) {
@@ -463,6 +492,161 @@ static void process_control_cleanup() {
   logger_log(logger, LOG_LEVEL_DEBUG, "Closing logger");
   logger_close(logger);  
 
+}
+
+/**
+ * Register the keyboard async signals (CTRL-C, CTRL-Z) to the process holding terminal control
+ */
+static void register_async_signals() {
+  if (!flag_sigint && !flag_sigtstp) {
+    return;
+  }
+
+  // if it ever goes to INIT, ignore
+  if (term_ctrl_pid == INIT_PID) {
+    logger_log(logger, LOG_LEVEL_INFO, "Async signal ignored for INIT");
+    return;
+  }
+
+  // if not shell holding terminal control
+  if (term_ctrl_pid != INIT_PID + 1) {
+    pcb_t* proc = get_pcb_at_pid(term_ctrl_pid);
+    if (proc) {
+      if (flag_sigint) {
+        proc->pending_signals = P_SIG_ADDSIG(proc->pending_signals, P_SIGTERM);
+        logger_log(logger, LOG_LEVEL_DEBUG, "P_SIGTERM registered for PID[%d] (from keyboard)", term_ctrl_pid);
+      }
+  
+      if (flag_sigtstp) {
+        proc->pending_signals = P_SIG_ADDSIG(proc->pending_signals, P_SIGSTOP);
+        logger_log(logger, LOG_LEVEL_DEBUG, "P_SIGSTOP registered for PID[%d] (from keyboard)", term_ctrl_pid);
+      }
+
+      vec_push_back(&pending_sig_prcs, proc);
+    }
+  }
+
+  flag_sigint = false;
+  flag_sigtstp = false;
+}
+
+/**
+ * Handle the pending signals during the quantum gap
+ */
+static void handle_pending_signals() {
+  for (size_t i = 0; i < vec_len(&pending_sig_prcs); ++i) {
+    pcb_t* proc = vec_get(&pending_sig_prcs, i);
+    if (!proc) {
+      logger_log(logger, LOG_LEVEL_WARN, "Null PCB found in pending_sig_prcs in handle_pending_signals");
+      continue;
+    }
+
+    signalset_t sigset = proc->pending_signals;
+
+    if (P_SIG_HASSIG(sigset, P_SIGTERM)) {
+      logger_log(logger, LOG_LEVEL_DEBUG, "Process P_SIGTERM for PID[%d]", proc->pid);
+
+      // process will be killed by signal, other signals will be ignored
+
+      if (proc->state == PROCESS_STATE_TERMINATED) {
+        proc->pending_signals = 0;
+        continue;
+      }
+
+      lifecycle_event_log(proc, "SIGNALED", NULL);
+
+      // remove from ready queues and blocking list if necessary
+      if (proc->state == PROCESS_STATE_READY) {
+        if (remove_pcb_first_from_vec(proc, &ready_prcs_queues[proc->priority])) {
+          logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] removed from ready queue %d in handle_pending_signals", proc->pid, proc->priority);
+        } else {
+          logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] not found in ready queue %d in handle_pending_signals", proc->pid, proc->priority);
+        } 
+      } else if (proc->state == PROCESS_STATE_BLOCKED) {
+        if (remove_pcb_first_from_vec(proc, &blocked_prcs)) {
+          logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] removed from blocked list in handle_pending_signals", proc->pid);
+        } else {
+          logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] not found in blocked list in handle_pending_signals", proc->pid);
+        } 
+      }
+
+      // cancel pthread
+      spthread_t spthd = proc->spthread;
+      spthread_cancel(spthd);
+      spthread_continue(spthd);
+      spthread_suspend(spthd); // forces the spthread to hit a cancellation point
+
+      // register waitable for parent and trigger orphan adoption
+      process_deathbed(proc);
+
+      proc->state = PROCESS_STATE_TERMINATED;
+      proc->pending_signals = 0;
+
+      // other signals will be ignored
+      continue;
+    }
+
+    // note: if both P_SIGSTOP and P_SIGCONT are received, P_SIGSTOP will prevail (as Linux does)
+    if (P_SIG_HASSIG(sigset, P_SIGSTOP)) {
+      logger_log(logger, LOG_LEVEL_DEBUG, "Process P_SIGSTOP for PID[%d]", proc->pid);
+
+      if (proc->state == PROCESS_STATE_TERMINATED || proc->state == PROCESS_STATE_STOPPED) {
+        proc->pending_signals = 0;
+        continue;
+      }
+
+      // remove from ready queues if necessary
+      if (proc->state == PROCESS_STATE_READY) {
+        if (remove_pcb_first_from_vec(proc, &ready_prcs_queues[proc->priority])) {
+          logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] removed from ready queue %d in handle_pending_signals", proc->pid, proc->priority);
+        } else {
+          logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] not found in ready queue %d in handle_pending_signals", proc->pid, proc->priority);
+        } 
+      }
+      // blocked list do not need to be checked as a process stays in the blocked list if both blocked and stopped
+
+      if (proc->parent) {
+        vec_push_back(&proc->parent->waitable_children, proc);
+      }
+
+      proc->state = PROCESS_STATE_STOPPED;    // blocked process will also be marked stopped
+      proc->pending_signals = 0;
+
+      // P_SIGCONT will be ignored
+      continue;
+    }
+
+    if (P_SIG_HASSIG(sigset, P_SIGCONT)) {
+      logger_log(logger, LOG_LEVEL_DEBUG, "Process P_SIGCONT for PID[%d]", proc->pid);
+
+      if (proc->state == PROCESS_STATE_STOPPED) {
+
+        if (proc->blocked_by_sleep || proc->waiting_child_pid != 0) {
+          // process is also blocked
+          proc->state = PROCESS_STATE_BLOCKED;
+
+        } else {
+          // not blocked, put back to ready queue
+          proc->state = PROCESS_STATE_READY;
+          if (proc != running_prc) {
+            // put into ready queue only if it is not running_prc, to avoid double-queuing 
+            // (running_prc will be added back to ready queue by scheduler after quantum finishes
+            // if its state is READY)
+            vec_push_back(&ready_prcs_queues[proc->priority], proc);
+            logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] continued and ready for schedule (put into ready queue[%d])", proc->pid, proc->priority);
+          }
+        }
+
+      }
+    }
+
+    if (proc->parent) {
+      vec_push_back(&proc->parent->waitable_children, proc);
+    }
+    proc->pending_signals = 0;
+  }
+
+  vec_clear(&pending_sig_prcs);
 }
 
 /**
@@ -977,6 +1161,34 @@ static void set_process_name(pcb_t* pcb, const char* process_name) {
 }
 
 /**
+ * For a process that is about to die, handle its children and register waitable status to its parent
+ * May be called by k_exit() or handle_pending_signals()
+ */
+static void process_deathbed(pcb_t* proc) {
+  if (!proc) {
+    return;
+  }
+
+  // add self to parent's waitable children
+  if (proc->parent) {
+    vec_push_back(&(proc->parent->waitable_children), proc);
+  }
+
+  if (term_ctrl_pid == proc->pid) {
+    term_ctrl_pid = INIT_PID + 1;
+  }
+
+  lifecycle_event_log(proc, "ZOMBIE", NULL);
+
+  // have INIT adopt all children (and waitable children)
+  logger_log(logger, LOG_LEVEL_DEBUG,
+    "Triggering INIT adoption for PID[%d] (%zu children, %zu waitable_children)",
+    proc->pid, vec_len(&proc->children), vec_len(&proc->waitable_children));
+  init_adopt_children(proc);
+
+}
+
+/**
  * Helper function to print log the schedule events
  */
 static void schedule_event_log(pcb_t* proc, schedule_priority priority) {
@@ -1241,6 +1453,38 @@ int k_nice(pid_t pid, int priority) {
 
 }
 
+int k_kill(pid_t pid, int signal) {
+  if (pid <= 0) {
+    // TODO: set errno    invalid argument / PID does not exist
+    return -1;
+  }
+
+  // do not allow sending signal to INIT
+  if (pid == INIT_PID) {
+    // TODO: set errno    no permission
+    return -1;
+  }
+
+  pcb_t* proc = get_pcb_at_pid(pid);
+  if (!proc) {
+    // TODO: set errno    PID does not exist
+    return -1;
+  }
+
+  // ignore signals sent to zombie processes but normal return
+  if (proc->state == PROCESS_STATE_TERMINATED) {
+    return 0;
+  }
+
+  // register pending sigset in pcb
+  proc->pending_signals = P_SIG_ADDSIG(proc->pending_signals, signal);
+
+  // record the process which has pending signal
+  vec_push_back(&pending_sig_prcs, proc);
+
+  return 0;
+}
+
 void k_sleep(clock_tick_t ticks) {
   pcb_t* self_pcb = k_get_self_pcb();
   assert_non_null(self_pcb, "Self PCB null in k_sleep");
@@ -1265,18 +1509,7 @@ void k_exit(void) {
 
   lifecycle_event_log(self_pcb, "EXITED", NULL);
 
-  // add self to parent's waitable children
-  if (self_pcb->parent) {
-    vec_push_back(&(self_pcb->parent->waitable_children), self_pcb);
-  }
-
-  lifecycle_event_log(self_pcb, "ZOMBIE", NULL);
-
-  // have INIT adopt all children (and waitable children)
-  logger_log(logger, LOG_LEVEL_DEBUG,
-    "Triggering INIT adoption in k_exit for PID[%d] (%zu children, %zu waitable_children)",
-    self_pcb->pid, vec_len(&self_pcb->children), vec_len(&self_pcb->waitable_children));
-  init_adopt_children(self_pcb);
+  process_deathbed(self_pcb);
 
   self_pcb->state = PROCESS_STATE_TERMINATED;
   
@@ -1289,6 +1522,22 @@ void k_shutdown(void) {
   shutdown = true;
   assert_non_negative(pthread_mutex_unlock(&shutdown_mtx), "Mutex unlock error in k_shutdown");
   assert_non_negative(spthread_enable_interrupts_self(), "Error enable_interrupts in k_shutdown");
+}
+
+int k_tcsetpid(pid_t pid) {
+  if (pid <= 0) {
+    // TODO: errno
+    return -1;
+  }
+
+  if (!get_pcb_at_pid(pid)) {
+    // TODO: errno
+    return -1;
+  }
+
+  term_ctrl_pid = pid;
+  return 0;
+
 }
 
 pcb_t* k_get_self_pcb() {

@@ -1,6 +1,8 @@
 #include "internal/process_control.h"       // internal kernel
 #include "user/shell.h"
 
+// TODO: use write or dprintf instead
+
 void print_welcome_banner();
 
 int main(int argc, char *argv[]) {
@@ -14,7 +16,7 @@ int main(int argc, char *argv[]) {
   // TODO
 
   /* RUN KERNEL (incl. INIT creation, run scheduler, spawn shell) */
-  Logger* logger = logger_init_stderr(LOG_LEVEL_ERROR, "KERNEL");
+  Logger* logger = logger_init_stderr(LOG_LEVEL_INFO, "KERNEL");
   k_set_logger(logger);
 
   fprintf(stderr, "Starting kernel...\n");

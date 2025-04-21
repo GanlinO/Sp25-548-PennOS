@@ -40,9 +40,7 @@ pid_t s_waitpid(pid_t pid, int* wstatus, bool nohang) {
 
 
 int s_kill(pid_t pid, int signal) {
-  // TODO
-  return 0;
-
+  return k_kill(pid, signal);
 }
 
 
@@ -62,6 +60,21 @@ int s_nice(pid_t pid, int priority) {
 
 void s_sleep(clock_tick_t ticks) {
   k_sleep(ticks);
+}
+
+int s_tcsetpid(pid_t pid) {
+  return k_tcsetpid(pid);
+}
+
+pid_t s_getselfpid() {
+  pid_t self = k_get_pid(k_get_self_pcb());
+
+  if (self <= 0) {
+    // TODO: errno
+    return -1;
+  }
+
+  return self;
 }
 
 void s_printprocess(void) {

@@ -12,6 +12,8 @@
 
 #define PROMPT "\033[1m\033[36mPennOS > \033[0m"
 
+// TODO: use write or dprintf instead
+
 static char* buf = NULL;
 static int buf_len = 0;
 
@@ -29,6 +31,7 @@ cmd_func_match_t independent_funcs[] = {
   {"zombify", zombify},
   {"orphanify", orphanify},
   {"busy", busy},
+  {"kill", kill},
   {NULL, NULL}
 };
 
@@ -62,6 +65,10 @@ void* shell_main(void* arg) {
   assert_non_null(buf, "Error mallocing for buf");
 
   struct parsed_command* cmd = NULL;
+  pid_t shell_pid = s_getselfpid();
+  assert_non_negative(shell_pid, "Shell PID invalid");
+
+  // TODO: when do we reap background jobs?
 
   while (!exit_shell) {
     free(cmd);
@@ -88,7 +95,10 @@ void* shell_main(void* arg) {
     // if run as foreground, wait for it as needed; if run as background, store PID for the job
     if (!cmd->is_background) {
       // foreground job
+      s_tcsetpid(child_pid);
       s_waitpid(child_pid, NULL, false);
+      s_tcsetpid(shell_pid);
+      
     } else {
       // backgroung job
       // TODO: store PID info in job list
@@ -116,6 +126,63 @@ void* busy(void* arg) {
   while (true) {
     // intentionally spinning
   }
+  return NULL;
+}
+
+void* kill(void* arg) {
+  // TODO: not completely finished
+
+  if (!arg) {
+    return NULL;
+  }
+
+  char** argv = (char**) arg;
+
+  // VALIDATE ARGUMENTS
+  if (!argv || argv[0] == NULL) {
+    fprintf(stderr, "Error: Invalid arg.\n");
+    return NULL;
+  }
+
+  int argc = get_argc(argv);
+  // need at least 2 arguments
+  if (argc < 2) {
+    fprintf(stderr, "%s Error: Incorrect number of args.\n", argv[0]);
+    return NULL;
+  }
+
+  int pid_start_index = 1;
+  int signal = P_SIGTERM;
+  if (argv[1] && argv[1][0] == '-') {
+    ++pid_start_index;
+
+    if (strcmp(argv[1], "-cont") == 0) {
+      signal = P_SIGCONT;
+    } else if (strcmp(argv[1], "-stop") == 0) {
+      signal = P_SIGSTOP;
+    } else if (strcmp(argv[1], "-term") == 0) {
+      signal = P_SIGTERM;
+    } else {
+      fprintf(stderr, "%s Error: Invalid arg: %s.\n", argv[0], argv[1]);
+      return NULL;
+    }
+  }
+
+  // TODO: error checking and multiple processes
+
+  int pid;
+  if (!str_to_int(argv[pid_start_index], &pid) || pid <= 0) {
+    fprintf(stderr, "%s Error: Invalid arg: %s. PID number should be a positive integer.\n", argv[0], argv[pid_start_index]);
+    return NULL;
+  }
+
+  if (s_kill(pid, signal) == 0) {
+    fprintf(stderr, "Signal <%d> sent to PID [%d].\n", signal, pid);
+  } else {
+    // TODO: errno checking, more verbose error explanation
+    fprintf(stderr, "Error sending signal to PID [%d].\n", pid);
+  }
+
   return NULL;
 }
 

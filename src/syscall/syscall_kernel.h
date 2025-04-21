@@ -2,6 +2,7 @@
 #define SYSCALL_KERNEL_H_
 
 #include "../common/pennos_types.h"
+#include "../common/pennos_signals.h"
 
 /**
  * @brief Create a child process that executes the function `func`.
@@ -67,6 +68,18 @@ int s_nice(pid_t pid, int priority);
  * than 0.
  */
 void s_sleep(clock_tick_t ticks);
+
+/**
+ * @brief Set the terminal control to a process
+ * @return 0 on success, -1 on error.
+ */
+int s_tcsetpid(pid_t pid);
+
+/**
+ * @brief Get the PID of the process itself
+ * @return pid number on success, -1 on error
+ */
+pid_t s_getselfpid();
 
 /**
  * @brief List all processes on PennOS, displaying PID, PPID, priority, status,

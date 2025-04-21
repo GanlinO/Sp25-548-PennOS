@@ -2,6 +2,7 @@
 #define PROCESS_CONTROL_H
 
 #include "../common/pennos_types.h"  // for pid_t clock_tick_t def
+#include "../common/pennos_signals.h"
 #include "../util/logger.h"   // for logging requirement
 
 /* process control block, intentional hidden implementation */
@@ -62,6 +63,15 @@ pid_t k_waitpid(pid_t pid, int* wstatus, bool nohang);
 int k_nice(pid_t pid, int priority);
 
 /**
+ * @brief Send a signal to a particular process.
+ *
+ * @param pid Process ID of the target proces.
+ * @param signal Signal number to be sent.
+ * @return 0 on success, -1 on error.
+ */
+int k_kill(pid_t pid, int signal);
+
+/**
  * @brief Suspends execution of the calling proces for a specified number of
  * clock ticks.
  *
@@ -85,6 +95,12 @@ void k_exit(void);
  * @brief Initiate the shutdown of scheduler
  */
 void k_shutdown(void);
+
+/**
+ * @brief Set the terminal control to a process
+ * @return 0 on success, -1 on error.
+ */
+int k_tcsetpid(pid_t pid);
 
 /**
  * Get the PCB pointer for current process
