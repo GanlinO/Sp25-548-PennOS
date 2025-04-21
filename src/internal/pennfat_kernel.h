@@ -3,44 +3,30 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include <time.h>
 
-/* File Modes */
-#define F_READ    1
-#define F_WRITE   2
-#define F_APPEND  3
+#include "../common/pennfat_errors.h"
 
-/* lseek Whence Constants */
-#define F_SEEK_SET 0
-#define F_SEEK_CUR 1
-#define F_SEEK_END 2
+/* Initialization function: call this from your main application */
+void pennfat_kernel_init(void);
 
-/* FAT Error Codes */
-enum PennFatErr
-{
-    PennFatErr_SUCCESS      = 0,
-    PennFatErr_INTERNAL     = -1,
-    PennFatErr_NOT_MOUNTED  = -2,
-    PennFatErr_INVAD        = -3,
-    PennFatErr_EXISTS       = -4,
-    PennFatErr_PERM         = -7,
-    PennFatErr_INUSE        = -8,
-    PennFatErr_NOSPACE      = -9,
-    PennFatErr_OUTOFMEM     = -10
-};
-typedef enum PennFatErr PennFatErr;
+/* Cleanup function: call this during application shutdown */
+void pennfat_kernel_cleanup(void);
 
 /* Kernel-Level API */
-int k_open(const char *fname, int mode);
-int k_close(int fd);
-int k_read(int fd, int n, char *buf);
-int k_write(int fd, const char *buf, int n);
-int k_unlink(const char *fname);
-int k_lseek(int fd, int offset, int whence);
-int k_ls(const char *fname);
+PennFatErr k_open(const char *fname, int mode);
+PennFatErr k_close(int fd);
+PennFatErr k_read(int fd, int n, char *buf);
+PennFatErr k_write(int fd, const char *buf, int n);
+PennFatErr k_unlink(const char *fname);
+PennFatErr k_lseek(int fd, int offset, int whence);
+PennFatErr k_ls(void);
+PennFatErr k_touch(const char *fname);
+PennFatErr k_rename(const char *oldname, const char *newname);
+PennFatErr k_chmod(const char *fname, uint8_t perm);
 
 /* Mount/Unmount */
-int mount_fs(const char *fs_name);
-int unmount_fs(void);
+PennFatErr k_mount(const char *fs_name);
+PennFatErr k_unmount(void);
+PennFatErr k_mkfs(const char *fs_name, int blocks_in_fat, int block_size_config);
 
 #endif /* PENNFAT_KERNEL_H */

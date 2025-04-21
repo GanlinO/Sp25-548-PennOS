@@ -1,2 +1,8 @@
 .DS_Store
 .vscode/
+bin/*
+logs/
+*fs
+*.json
+.cache*
+*.o

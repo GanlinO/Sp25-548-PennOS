@@ -8,7 +8,7 @@ static Logger *logger = NULL;
 
 int main(void) {
     // Initialize a logger with the name "test_logger" and DEBUG level
-    LOGGER_INIT("test_logger");
+    LOGGER_INIT("test_logger", LOG_LEVEL_DEBUG);
 
     // Check if the logger was initialized successfully
     if (logger == NULL) {
