@@ -41,6 +41,21 @@ Logger* logger_init(const char* name, LogLevel level) {
     return logger;
 }
 
+Logger* logger_init_stderr(LogLevel level, const char* name) {
+    Logger* logger = (Logger*)malloc(sizeof(Logger));
+    if (!logger) {
+        return NULL;
+    }
+
+    logger->fp = stderr;
+    logger->level = level;
+
+    strncpy(logger->name, name, sizeof(logger->name) - 1);
+    logger->name[sizeof(logger->name) - 1] = '\0';
+
+    return logger;
+}
+
 void logger_log(Logger* logger, LogLevel level, const char* format, ...) {
     if (!logger || !logger->fp) {
         return;
@@ -82,7 +97,7 @@ void logger_log(Logger* logger, LogLevel level, const char* format, ...) {
 
 void logger_close(Logger* logger) {
     if (logger) {
-        if (logger->fp) {
+        if (logger->fp && logger->fp != stderr && logger->fp != stdout) {
             fclose(logger->fp);
         }
         free(logger);

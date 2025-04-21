@@ -2,11 +2,24 @@
 #define UTILS_H
 
 #include <stdio.h>
+#include <sys/types.h>  // for ssize_t
 #include "parser.h"
 
 typedef struct parsed_command
     command_t;  // typedef struct parsed_command parsed_command_t;
 
+// (For process control module)
+/**
+ * Check that ptr is not null, print message and exit with EXIT_FAILURE otherwise
+ */
+void assert_non_null(const void* const ptr, const char* const description);
+
+/**
+ * Check that val is not negative, print message and exit with EXIT_FAILURE otherwise
+ */
+void assert_non_negative(ssize_t val, const char* description);
+
+// (For PennFAT module)
 /**
  * Execute parse_command() and handles its errors, if any.
  * @param cmd_line The command line to parse.
