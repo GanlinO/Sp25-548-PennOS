@@ -20,6 +20,7 @@ void assert_non_negative(ssize_t val, const char* description) {
     perror(description);
   }
   panic("non-negative assertion failed");
+}
 
 void prompt(const char *prompt) {
     printf("%s", prompt);
