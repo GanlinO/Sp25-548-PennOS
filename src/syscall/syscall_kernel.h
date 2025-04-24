@@ -2,7 +2,6 @@
 #define SYSCALL_KERNEL_H_
 
 #include "../common/pennos_types.h"
-#include "../common/pennos_signals.h"
 
 /**
  * @brief Create a child process that executes the function `func`.
