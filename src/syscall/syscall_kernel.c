@@ -1,48 +1,112 @@
+/* ─── src/syscall/syscall_kernel.c ───────────────────────────────────────── */
 #include "syscall_kernel.h"
 #include "../internal/process_control.h"
 #include "../util/utils.h"
+#include <errno.h>
+#include <unistd.h>   // dup2, close
+#include <stdlib.h>
 
-pid_t s_spawn(void* (*func)(void*), char* argv[], int fd0, int fd1) {
-  if (func == NULL) {
-    return -1;                 // invalid argument
+/* ---------- internal helper to pass (fd0,fd1) to the new routine -------- */
+
+typedef struct spawn_wrapper_arg {
+  void *(*func)(void *);
+  void  *real_arg;
+  int    fd0;
+  int    fd1;
+} spawn_wrapper_arg;
+
+/* runs in the CHILD ─ before user “func” */
+static void *spawn_entry_wrapper(void *raw)
+{
+  spawn_wrapper_arg *wrap = (spawn_wrapper_arg *)raw;
+
+  /* ---------- fd inheritance plumbing ---------- */
+  if (wrap->fd0 >= 0 && wrap->fd0 != STDIN_FILENO) {
+    dup2(wrap->fd0, STDIN_FILENO);
+    close(wrap->fd0);
+  }
+  if (wrap->fd1 >= 0 && wrap->fd1 != STDOUT_FILENO) {
+    dup2(wrap->fd1, STDOUT_FILENO);
+    close(wrap->fd1);
   }
 
-  pcb_t* my_pcb_ptr = k_get_self_pcb();
-  // TODO: return -1 and set errno instead?
-  assert_non_null(my_pcb_ptr, "Self PCB not found in s_spawn");
+  /* hand-off to the user function */
+  void *ret = wrap->func(wrap->real_arg);
 
-  pcb_t* child_pcb_ptr = k_proc_create(my_pcb_ptr);
-  // TODO: return -1 and set errno instead?
-  assert_non_null(child_pcb_ptr, "Child PCB not created");
+  free(wrap);
+  return ret;
+}
 
-  // TODO: update fd0 and fd1 for child
+/* -------------------------- s_spawn -------------------------------------- */
+pid_t s_spawn(void* (*func)(void*), char* argv[], int fd0, int fd1)
+{
+  if (!func) { errno = EINVAL; return -1; }
 
-  int set_routine_status = k_set_routine_and_run(child_pcb_ptr, func, argv);
-  if (set_routine_status < 0) {
-    // -1 for failed spthread creation, -2 for invalid argument (which should already be ruled out)
-    k_proc_cleanup(child_pcb_ptr);
-    return -1; 
-    // TODO: set error number
+  /* 1. create PCB */
+  pcb_t *parent = k_get_self_pcb();
+  assert_non_null(parent, "s_spawn: parent missing");
+
+  pcb_t *child  = k_proc_create(parent);
+  if (!child) { errno = EAGAIN; return -1; }
+
+  /* 2. wrap arguments for the child */
+  spawn_wrapper_arg *wrap = malloc(sizeof(*wrap));
+  if (!wrap) { k_proc_cleanup(child); errno = ENOMEM; return -1; }
+
+  *wrap = (spawn_wrapper_arg){
+      .func     = func,
+      .real_arg = argv,
+      .fd0      = fd0,
+      .fd1      = fd1,
+  };
+
+  /* 3. start routine (initially suspended; scheduler will run it) */
+  if (k_set_routine_and_run(child, spawn_entry_wrapper, wrap) < 0) {
+      free(wrap);
+      k_proc_cleanup(child);
+      errno = EAGAIN;
+      return -1;
   }
 
-  pid_t child_pid = k_get_pid(child_pcb_ptr);
-  if (child_pid <= 0) {
+  return k_get_pid(child);     /* success: return new PID */
+}
+
+/* ------------------- thin wrappers -------------------------------------- */
+pid_t s_waitpid(pid_t pid, int *wstatus, bool nohang)
+{
+  pid_t r = k_waitpid(pid, wstatus, nohang);
+  if (r < 0) errno = ECHILD;
+  return r;
+}
+
+int s_kill(pid_t pid, int signal)
+{
+  int r = k_kill(pid, signal);
+  if (r < 0) errno = ESRCH;
+  return r;
+}
+
+int s_tcsetpid(pid_t pid)
+{
+  int r = k_tcsetpid(pid);
+  if (r < 0) errno = EPERM;
+  return r;
+}
+
+pid_t s_getselfpid() {
+  pid_t self = k_get_pid(k_get_self_pcb());
+
+  if (self <= 0) {
+    // TODO: errno
     return -1;
   }
 
-  return child_pid;
+  return self;
 }
 
-
-pid_t s_waitpid(pid_t pid, int* wstatus, bool nohang) {
-  return k_waitpid(pid, wstatus, nohang);
+void s_printprocess(void) {
+  k_printprocess();
 }
-
-
-int s_kill(pid_t pid, int signal) {
-  return k_kill(pid, signal);
-}
-
 
 void s_exit(void) {
   k_exit();
@@ -60,23 +124,4 @@ int s_nice(pid_t pid, int priority) {
 
 void s_sleep(clock_tick_t ticks) {
   k_sleep(ticks);
-}
-
-int s_tcsetpid(pid_t pid) {
-  return k_tcsetpid(pid);
-}
-
-pid_t s_getselfpid() {
-  pid_t self = k_get_pid(k_get_self_pcb());
-
-  if (self <= 0) {
-    // TODO: errno
-    return -1;
-  }
-
-  return self;
-}
-
-void s_printprocess(void) {
-  k_printprocess();
 }
