@@ -2,6 +2,7 @@
 #include "../util/spthread.h" // for spthread
 #include "../util/Vec.h"      // for Vec
 #include "../util/utils.h"    // for assert_non_null
+#include <sys/time.h>
 
 #include <stdlib.h>
 #include <signal.h>           // for scheduler handling SIGALRM

@@ -1,5 +1,6 @@
 #include "shell.h"
 #include "../syscall/syscall_kernel.h"
+#include "../common/pennos_signals.h"
 #include "../util/parser.h"
 #include "../util/utils.h"
 
