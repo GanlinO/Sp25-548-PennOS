@@ -21,6 +21,7 @@ void* cp_file(void* arg);      /* NEW */
 void* mv_file(void* arg);      /* NEW */
 void* rm_file(void* arg);      /* NEW */
 
+
 /*──────────────────────────────────────────────────────────────*/
 /*  Dispatch tables                                             */
 /*──────────────────────────────────────────────────────────────*/
@@ -71,7 +72,7 @@ static int   buf_len = 0;
 static bool  exit_shell = false;
 
 static struct parsed_command* read_command();
-static pid_t process_one_command(char** cmd);
+static pid_t process_one_command(char **cmd, int fd0, int fd1);
 
 static thd_func_t get_func_from_cmd(const char * cmd_name, cmd_func_match_t* table);
 static int  get_argc(char** argv);
@@ -79,6 +80,9 @@ static bool str_to_int(const char * str, int* ret_val);
 
 [[maybe_unused]] static void debug_print_argv(char** argv);
 [[maybe_unused]] static void debug_print_parsed_command(struct parsed_command*);
+
+static int open_for_read(const char *path);
+static int open_for_write(const char *path, bool append);
 
 /*──────────────────────────────────────────────────────────────*/
 /*                NEW  BUILT-IN  IMPLEMENTATIONS                */
@@ -324,7 +328,38 @@ void* shell_main(void* arg) {
     cmd = read_command();
     if (!cmd || cmd->num_commands == 0) continue;
 
-    pid_t child_pid = process_one_command(cmd->commands[0]);
+  /*----------------------------------------------*
+ *  Handle <  >  >>  from the parsed structure  *
+ *----------------------------------------------*/
+int redir_in  = STDIN_FILENO;   /* default: inherit from shell */
+int redir_out = STDOUT_FILENO;
+bool close_in  = false;         /* whether we must k_close later */
+bool close_out = false;
+
+/* open input redirection, if any */
+if (cmd->stdin_file) {
+  int fd = open_for_read(cmd->stdin_file);
+  if (fd < 0) {
+    fprintf(stderr, "shell: cannot open %s for reading\n", cmd->stdin_file);
+    goto AFTER_LOOP_CLEANUP;
+  }
+  redir_in = fd;  close_in = true;
+}
+
+/* open output redirection, if any */
+if (cmd->stdout_file) {
+  int fd = open_for_write(cmd->stdout_file, cmd->is_file_append);
+  if (fd < 0) {
+    fprintf(stderr, "shell: cannot open %s for writing\n", cmd->stdout_file);
+    if (close_in) k_close(redir_in);
+    goto AFTER_LOOP_CLEANUP;
+  }
+  redir_out = fd;  close_out = true;
+}
+
+
+pid_t child_pid = process_one_command(cmd->commands[0],
+  redir_in, redir_out);
 
     if (child_pid <= 0) continue;
 
@@ -334,7 +369,14 @@ void* shell_main(void* arg) {
       s_tcsetpid(shell_pid);
     } else {
       /* TODO: store background job info */
+
     }
+
+    if (close_in)  k_close(redir_in);
+    if (close_out) k_close(redir_out);
+
+    AFTER_LOOP_CLEANUP:
+    ;   /* empty statement so the label isn’t alone */
   }
 
   free(cmd);
@@ -342,6 +384,7 @@ void* shell_main(void* arg) {
   fprintf(stderr, "Shell exits\n");
   return NULL;
 }
+
 
 /* Existing built-ins (busy / kill / ps / testing helpers) remain unchanged */
 /* … (the rest of the original file’s content is intentionally left intact) */
@@ -555,6 +598,14 @@ void* orphanify(void* arg) {
   return NULL;
 }
 
+/* open <file> for shell redirection, return FD or negative error */
+static int open_for_read(const char *path) {
+  return k_open(path, K_O_RDONLY);
+}
+static int open_for_write(const char *path, bool append) {
+  int flags = K_O_CREATE | (append ? K_O_APPEND : K_O_WRONLY);
+  return k_open(path, flags);
+}
 
 /******************************************
  *       internal help functions          *
@@ -623,7 +674,7 @@ static struct parsed_command* read_command() {
  * @note Note that `nice` may spawn a separate process though it is run as a subroutine itself.
  */
 
-static pid_t process_one_command(char** cmd) {
+static pid_t process_one_command(char **cmd, int fd0, int fd1) {
   if (cmd == NULL || cmd[0] == NULL) {
     fprintf(stderr, "Error: Null command.\n");
     return -2;
@@ -636,7 +687,7 @@ static pid_t process_one_command(char** cmd) {
     // FOUND INDEPENDENT FUNC COMMAND
     // spawn new process to run the command
     // TODO: do we need to update fds
-    child_pid = s_spawn(func, cmd, 0, 1);
+    child_pid = s_spawn(func, cmd, fd0, fd1);
     if (child_pid < 0) {
       fprintf(stderr, "%s Error: spawn failed.\n", cmd[0]);
     }
