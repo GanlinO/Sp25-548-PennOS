@@ -1214,10 +1214,10 @@ static void lifecycle_event_log(pcb_t* proc, char* event_name, char* add_msg){
     logger_log(logger, LOG_LEVEL_WARN, "PCB null in lifecycle_event_log");
     return;
   }
-  logger_log(logger, LOG_LEVEL_INFO, "\t[%4d]\t%-7s\t%d\t%d\t%s %s",
-    clock_tick, (event_name) ? event_name : "<EVENT>", proc->pid,
-    proc->priority, (proc->process_name) ? proc->process_name : "<null>",
-    (add_msg) ? add_msg : "");
+  // logger_log(logger, LOG_LEVEL_INFO, "\t[%4d]\t%-7s\t%d\t%d\t%s %s",
+  //   clock_tick, (event_name) ? event_name : "<EVENT>", proc->pid,
+  //   proc->priority, (proc->process_name) ? proc->process_name : "<null>",
+  //   (add_msg) ? add_msg : "");
 }
 
 /**

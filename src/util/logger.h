@@ -1,3 +1,5 @@
+#define GLOBAL_LOG_LEVEL LOG_LEVEL_ERROR 
+
 #ifndef LOGGER_H
 #define LOGGER_H
 
