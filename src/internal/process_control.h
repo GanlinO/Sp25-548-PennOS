@@ -123,4 +123,11 @@ void k_printprocess();
  */
 void k_set_logger(Logger* new_logger);
 
+/**
+* Create an anonymous, *close-on-exec* pipe.
+* @param fds  int[2] supplied by caller; on success fds[0]=read end, fds[1]=write end.
+* @return 0 on success, –1 on error (errno is set).
+*/
+int k_pipe(int fds[2]);
+
 #endif  // PROCESS_CONTROL_H

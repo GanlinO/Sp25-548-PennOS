@@ -87,4 +87,10 @@ pid_t s_getselfpid();
  */
 void s_printprocess(void);
 
+/**
+ * User-space wrapper for k_pipe().
+ * @param fds  int[2]; on success fds[0] is read, fds[1] is write.
+ */
+int s_pipe(int fds[2]);
+
 #endif  // SYSCALL_KERNEL_H_

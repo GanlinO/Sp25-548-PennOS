@@ -125,3 +125,11 @@ int s_nice(pid_t pid, int priority) {
 void s_sleep(clock_tick_t ticks) {
   k_sleep(ticks);
 }
+
+
+int s_pipe(int fds[2])
+{
+    int r = k_pipe(fds);
+    if (r < 0) errno = EMFILE;   /* may fine-tune later */
+    return r;
+}

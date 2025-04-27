@@ -519,7 +519,7 @@ static void touch(const char** args) {
 }
 
 static PennFatErr ls() {
-    return k_ls();
+    return k_ls(NULL);
 }
 
 static PennFatErr mv(const char *oldname, const char *newname) {

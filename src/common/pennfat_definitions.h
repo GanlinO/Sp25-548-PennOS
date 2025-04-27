@@ -20,7 +20,7 @@ static inline int is_valid_mode(int mode) {
     if (mode & ~(K_O_CREATE | K_O_RDONLY | K_O_WRONLY | K_O_APPEND)) {
         return 0; // invalid bits set
     }
-    
+
     // 2) Forbid using both WRITE and APPEND together
     if ((mode & K_O_WRONLY) && (mode & K_O_APPEND)) {
         return 0;
@@ -51,11 +51,13 @@ static inline int is_valid_mode(int mode) {
 #define CAN_WRITE(perm) (((perm) & PERM_WRITE) != 0)
 #define CAN_EXEC(perm)  (((perm) & PERM_EXEC) != 0)
 
-#define REQ_WRITE_PERM(mode) (((mode) & (K_O_WRONLY | K_O_APPEND)) != 0)
 #define REQ_READ_PERM(mode)  (((mode) & K_O_RDONLY) != 0)
+#define REQ_WRITE_PERM(mode) (((mode) & (K_O_WRONLY | K_O_APPEND)) != 0)
 
-#define VALID_PERM(perm) ((perm) == 0 || (perm) == 2 || (perm) == 4 || \
-                   (perm) == 5 || (perm) == 6 || (perm) == 7)
+#define VALID_PERM(perm) ((perm) == PERM_NONE || (perm) == PERM_EXEC || \
+                         (perm) == PERM_WRITE || (perm) == (PERM_READ | PERM_EXEC) || \
+                         (perm) == (PERM_READ | PERM_WRITE) || \
+                         (perm) == (PERM_READ | PERM_WRITE | PERM_EXEC))
 
 /* PennFAT directory entry: fixed 64 bytes */
 typedef struct {

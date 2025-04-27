@@ -2,11 +2,16 @@
 #include "../util/spthread.h" // for spthread
 #include "../util/Vec.h"      // for Vec
 #include "../util/utils.h"    // for assert_non_null
-#include <sys/time.h>
 
 #include <stdlib.h>
 #include <signal.h>           // for scheduler handling SIGALRM
 #include <string.h>           // for strlen and strcpy for process name
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sys/time.h>
+#include <fcntl.h>
+#include <errno.h>
 
 /********************
  *    definitions   *
@@ -1606,4 +1611,26 @@ void k_set_logger(Logger* new_logger) {
   } else {
     logger_log(logger, LOG_LEVEL_ERROR, "Attempt to set logger to NULL in process control");
   } 
+}
+
+static inline int set_cloexec(int fd)
+{
+    int flags = fcntl(fd, F_GETFD);
+    if (flags == -1) return -1;
+    return fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+}
+
+int k_pipe(int fds[2])
+{
+    if (pipe(fds) == -1)          /* ordinary POSIX pipe()              */
+        return -1;
+
+    /* mark both ends close-on-exec so children only inherit dup’ed FDs  */
+    if (set_cloexec(fds[0]) == -1 || set_cloexec(fds[1]) == -1) {
+        int save = errno;
+        close(fds[0]); close(fds[1]);
+        errno = save;
+        return -1;
+    }
+    return 0;
 }

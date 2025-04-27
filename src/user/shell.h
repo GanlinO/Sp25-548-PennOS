@@ -138,7 +138,7 @@ void* ps(void* arg);
  * Example Usage: kill -stop 1 2 (sends stop to processes 1 and 2)
  * Example Usage: kill -cont 1 (sends cont to process 1)
  */
-void* kill(void* arg);
+void* kill_cmd(void* arg);
 
 /******************************************
  *            SUB-ROUTINES                *

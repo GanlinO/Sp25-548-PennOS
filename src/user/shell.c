@@ -3,6 +3,8 @@
 #include "../common/pennos_signals.h"
 #include "../util/parser.h"
 #include "../util/utils.h"
+#include "jobs.h"
+#include <signal.h>
 
 #include "../internal/pennfat_kernel.h"
 #include "../common/pennfat_definitions.h"
@@ -50,6 +52,10 @@ cmd_func_match_t independent_funcs[] = {
   {"cp",   cp_file},     /* NEW – data-moving */
   {"mv",   mv_file},     /* NEW – data-moving */
   {"rm",   rm_file},     /* NEW – data-moving */
+  {"jobs",      jobs_builtin},
+  {"bg",        bg},
+  {"fg",        fg},
+  {"logout",    logout_cmd},
   {NULL, NULL}
 };
 
@@ -70,19 +76,28 @@ cmd_func_match_t sub_routines[] = {
 static char* buf = NULL;
 static int   buf_len = 0;
 static bool  exit_shell = false;
+static pid_t shell_pgid;                /* for signal-forwarding */
 
 static struct parsed_command* read_command();
-static pid_t process_one_command(char **cmd, int fd0, int fd1);
+static pid_t process_one_command(char ***cmdv, size_t stages,
+                                   const char *stdin_file,
+                                   const char *stdout_file,
+                                   const char *stderr_file,
+                                   bool append_out);
 
 static thd_func_t get_func_from_cmd(const char * cmd_name, cmd_func_match_t* table);
 static int  get_argc(char** argv);
 static bool str_to_int(const char * str, int* ret_val);
+
 
 [[maybe_unused]] static void debug_print_argv(char** argv);
 [[maybe_unused]] static void debug_print_parsed_command(struct parsed_command*);
 
 static int open_for_read(const char *path);
 static int open_for_write(const char *path, bool append);
+
+static pid_t spawn_stage(char **argv, int fd_in, int fd_out);
+static int  open_redirect(int *fd, const char *path, int flags);
 
 /*──────────────────────────────────────────────────────────────*/
 /*                NEW  BUILT-IN  IMPLEMENTATIONS                */
@@ -108,7 +123,7 @@ void* touch(void* arg)
 void* ls(void* arg)
 {
   (void)arg;          /* unused */
-  PennFatErr err = k_ls();
+  PennFatErr err = k_ls(NULL);
   if (err) fprintf(stderr, "ls: %s\n", PennFatErr_toErrString(err));
   return NULL;
 }
@@ -233,6 +248,13 @@ void* man(void* arg)
   return NULL;
 }
 
+static void forward(int signo)
+{
+    job_t *fg = jobs_current_fg();
+    if (fg)
+        s_kill(fg->pid, (signo == SIGINT) ? P_SIGINT : P_SIGSTOP);
+}
+
 /*======================================================================*/
 /*  Data-moving built-ins: cp / mv / rm                                 */
 /*======================================================================*/
@@ -318,8 +340,14 @@ void* shell_main(void* arg) {
   assert_non_null(buf, "malloc buf");
 
   struct parsed_command* cmd = NULL;
-  pid_t shell_pid = s_getselfpid();
-  assert_non_negative(shell_pid, "Shell PID invalid");
+  
+  shell_pgid = s_getselfpid();
+ assert_non_negative(shell_pgid, "Shell PID invalid");
+  jobs_init();                                   /* step 6 */
+
+  /* install Ctrl-C / Ctrl-Z forwarding (step 8) */
+  signal(SIGINT,  forward);
+  signal(SIGTSTP, forward);
 
   while (!exit_shell) {
     free(cmd);
@@ -350,7 +378,7 @@ if (cmd->stdin_file) {
 if (cmd->stdout_file) {
   int fd = open_for_write(cmd->stdout_file, cmd->is_file_append);
   if (fd < 0) {
-    fprintf(stderr, "shell: cannot open %s for writing\n", cmd->stdout_file);
+    fprintf(stderr, "shell: cannot open %s (%s)\n", cmd->stdout_file, PennFatErr_toErrString(fd));
     if (close_in) k_close(redir_in);
     goto AFTER_LOOP_CLEANUP;
   }
@@ -358,15 +386,19 @@ if (cmd->stdout_file) {
 }
 
 
-pid_t child_pid = process_one_command(cmd->commands[0],
-  redir_in, redir_out);
+ pid_t child_pid = process_one_command(cmd->commands,
+                                        cmd->num_commands,
+                                         cmd->stdin_file,
+                                         cmd->stdout_file,
+                                         /* stderr */ NULL,
+                                         cmd->is_file_append);
 
     if (child_pid <= 0) continue;
 
     if (!cmd->is_background) {            /* foreground job           */
       s_tcsetpid(child_pid);
       s_waitpid(child_pid, NULL, false);
-      s_tcsetpid(shell_pid);
+      s_tcsetpid(shell_pgid);
     } else {
       /* TODO: store background job info */
 
@@ -384,6 +416,8 @@ pid_t child_pid = process_one_command(cmd->commands[0],
   fprintf(stderr, "Shell exits\n");
   return NULL;
 }
+
+
 
 
 /* Existing built-ins (busy / kill / ps / testing helpers) remain unchanged */
@@ -665,59 +699,181 @@ static struct parsed_command* read_command() {
   return pcmd_ptr;
 }
 
-/**
- * Process one single command, while it can be either independent command or subroutine
- * @param cmd an array of c-strings with cmd[0] being the command name and the rest being its 
- * arguments, terminated by NULL.
- * @return the pid of the spawned process if a process is spawned. 0 if no process is spawned 
- * (for example, run as a subroutine). Negative number if there is an error.
- * @note Note that `nice` may spawn a separate process though it is run as a subroutine itself.
- */
+/*  NEW built-ins: jobs / bg / fg / logout – step 7               */
+void* jobs_builtin(void* arg) { jobs_list(); return NULL; }
 
-static pid_t process_one_command(char **cmd, int fd0, int fd1) {
-  if (cmd == NULL || cmd[0] == NULL) {
-    fprintf(stderr, "Error: Null command.\n");
-    return -2;
-  }
-
-  pid_t child_pid = 0;
-  thd_func_t func = get_func_from_cmd(cmd[0], independent_funcs);
-
-  if (func != NULL) {
-    // FOUND INDEPENDENT FUNC COMMAND
-    // spawn new process to run the command
-    // TODO: do we need to update fds
-    child_pid = s_spawn(func, cmd, fd0, fd1);
-    if (child_pid < 0) {
-      fprintf(stderr, "%s Error: spawn failed.\n", cmd[0]);
-    }
-
-  } else {
-    // command not found as independent command
-    // try as subroutine
-    thd_func_t func = get_func_from_cmd(cmd[0], sub_routines);
-    if (func != NULL) {
-
-      // FOUND SUBROUTINE
-      // run the subroutine directly
-      void* ret = func(cmd);
-
-      // special processing for u_nice as it also spawns process and is expected to return PID
-      if (func == u_nice && ret != NULL) {
-        // get pid
-        pid_t* ret_pid = (pid_t*) ret;
-        child_pid = *ret_pid;
-      }
-
-      free(ret);
-
-    } else {
-      // COMMAND DOES NOT EXIST
-      fprintf(stderr, "Command not recognized: %s\n", cmd[0]);
-    }
-  }
-  return child_pid;
+void* bg(void* arg)
+{
+  char** argv = (char**)arg;
+  int jid = argv[1] ? atoi(argv[1]+1) : -1;           /* %N form          */
+  job_t *j = (jid > 0) ? jobs_by_jid(jid) : NULL;
+  if (!j) { fprintf(stderr, "bg: job not found\n"); return NULL; }
+  s_kill(j->pid, P_SIGCONT);
+  j->state = JOB_RUNNING;
+  fprintf(stderr, "[%d] %s &\n", j->jid, j->cmdline);
+  return NULL;
 }
+
+void* fg(void* arg)
+{
+  char** argv = (char**)arg;
+  int jid = argv[1] ? atoi(argv[1]+1) : -1;
+  job_t *j = (jid > 0) ? jobs_by_jid(jid) : jobs_current_fg();
+  if (!j) { fprintf(stderr, "fg: job not found\n"); return NULL; }
+
+  s_kill(j->pid, P_SIGCONT);
+  j->state = JOB_RUNNING;
+  s_tcsetpid(j->pid);
+  s_waitpid(j->pid, NULL, true);
+  s_tcsetpid(shell_pgid);
+  jobs_remove(j->pid);
+  return NULL;
+}
+
+void* logout_cmd(void* arg)
+{
+  if (jobs_have_stopped()) {
+    fprintf(stderr, "logout: there are stopped jobs\n");
+    return NULL;
+  }
+  exit_shell = true;
+  return NULL;
+}
+
+// /**
+//  * Process one single command, while it can be either independent command or subroutine
+//  * @param cmd an array of c-strings with cmd[0] being the command name and the rest being its 
+//  * arguments, terminated by NULL.
+//  * @return the pid of the spawned process if a process is spawned. 0 if no process is spawned 
+//  * (for example, run as a subroutine). Negative number if there is an error.
+//  * @note Note that nice may spawn a separate process though it is run as a subroutine itself.
+//  */
+
+// static pid_t process_one_command(char **cmd, int fd0, int fd1) {
+//   if (cmd == NULL || cmd[0] == NULL) {
+//     fprintf(stderr, "Error: Null command.\n");
+//     return -2;
+//   }
+
+//   pid_t child_pid = 0;
+//   thd_func_t func = get_func_from_cmd(cmd[0], independent_funcs);
+
+//   if (func != NULL) {
+//     // FOUND INDEPENDENT FUNC COMMAND
+//     // spawn new process to run the command
+//     // TODO: do we need to update fds
+//     child_pid = s_spawn(func, cmd, fd0, fd1);
+//     if (child_pid < 0) {
+//       fprintf(stderr, "%s Error: spawn failed.\n", cmd[0]);
+//     }
+
+//   } else {
+//     // command not found as independent command
+//     // try as subroutine
+//     thd_func_t func = get_func_from_cmd(cmd[0], sub_routines);
+//     if (func != NULL) {
+
+//       // FOUND SUBROUTINE
+//       // run the subroutine directly
+//       void* ret = func(cmd);
+
+//       // special processing for u_nice as it also spawns process and is expected to return PID
+//       if (func == u_nice && ret != NULL) {
+//         // get pid
+//         pid_t* ret_pid = (pid_t*) ret;
+//         child_pid = *ret_pid;
+//       }
+
+//       free(ret);
+
+//     } else {
+//       // COMMAND DOES NOT EXIST
+//       fprintf(stderr, "Command not recognized: %s\n", cmd[0]);
+//     }
+//   }
+//   return child_pid;
+// }
+
+static int open_redirect(int *fd, const char *path, int flags)
+{
+    int newfd = k_open(path, flags);
+    if (newfd < 0) {
+        fprintf(stderr, "shell: cannot open %s\n", path);
+        return -1;
+    }
+    *fd = newfd;
+    return 0;
+}
+
+static pid_t spawn_stage(char **argv, int fd_in, int fd_out)
+{
+    if (!argv || !argv[0]) return -1;
+
+    thd_func_t func = get_func_from_cmd(argv[0], independent_funcs);
+    if (!func) {
+        fprintf(stderr, "command not found: %s\n", argv[0]);
+        return -1;
+    }
+    return s_spawn(func, argv, fd_in, fd_out);
+}
+
+static pid_t process_one_command(char **cmdv[], size_t stages,
+                                   const char *stdin_file,
+                                   const char *stdout_file,
+                                   const char *stderr_file,
+                                   bool append_out)
+  {
+   int prev_rd = STDIN_FILENO;
+      int first_pid = -1;
+  
+      /* optional <  redirection for very first stage */
+      if (stdin_file && open_redirect(&prev_rd, stdin_file, K_O_RDONLY) < 0)
+          return -1;
+  
+      for (size_t s = 0; s < stages; ++s) {
+          int pipefds[2] = {-1, -1};
+          int this_out = STDOUT_FILENO;
+  
+          /* if NOT last stage, create a pipe */
+          if (s + 1 < stages) {
+              if (s_pipe(pipefds) < 0) {
+                  perror("pipe");
+                  return -1;
+              }
+              this_out = pipefds[1];            /* writer for this stage        */
+          } else {
+              /* last stage may have > or >>   */
+              if (stdout_file) {
+                  int flags = K_O_CREATE | (append_out ? K_O_APPEND : K_O_WRONLY);
+                  if (open_redirect(&this_out, stdout_file, flags) < 0)
+                      return -1;
+              }
+          }
+  
+          /* stderr redirection only applies to *last* stage (bash semantics) */
+          if (s + 1 == stages && stderr_file) {
+              int fd;
+              if (open_redirect(&fd, stderr_file,
+                                K_O_CREATE | K_O_WRONLY) < 0)
+                  return -1;
+              /* we dup2(fd, STDERR_FILENO) inside spawn wrapper */
+              // pass fd as fd1? —> extend spawn_stage to accept fd_err
+              // quick path: after spawn, parent close(fd); see below
+              //  (keep design simple: child duplicates fd_err onto 2)
+          }
+  
+          pid_t pid = spawn_stage(cmdv[s], prev_rd, this_out);
+          if (pid < 0) return -1;
+          if (first_pid == -1) first_pid = pid;
+  
+          /* parent closes ends it no longer needs */
+         if (prev_rd != STDIN_FILENO) k_close(prev_rd);
+         if (this_out != STDOUT_FILENO) k_close(this_out);
+  
+          prev_rd = pipefds[0];  /* read end for next iteration (or dangling) */
+      }
+      return first_pid;
+  }
 
 static thd_func_t get_func_from_cmd(const char * cmd_name, cmd_func_match_t* func_match) {
   for (size_t i = 0; func_match[i].cmd != NULL; ++i) {

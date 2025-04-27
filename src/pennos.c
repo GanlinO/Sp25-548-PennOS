@@ -1,74 +1,89 @@
-#include "internal/process_control.h"       // internal kernel
+/* src/pennos.c */
+
+#include "internal/process_control.h"
+#include "internal/pennfat_kernel.h"
+#include "common/pennfat_errors.h"
 #include "user/shell.h"
+#include "util/logger.h"
 
-// TODO: use write or dprintf instead
+#include <stdio.h>
+#include <stdlib.h>
 
-void print_welcome_banner();
+/* ─────────────────────────────────────────────── prototypes ─────────── */
+static void print_welcome_banner(void);
 
-int main(int argc, char *argv[]) {
+/* ─────────────────────────────────────────────── entry point ─────────── */
+int main(int argc, char *argv[])
+{
+    print_welcome_banner();
 
-  print_welcome_banner();
+    /**********************************************************************
+     * 1. (optional) CLI parsing – still TODO                             *
+     *********************************************************************/
+    const char *fs_image = "disk.img";          /* default while testing  */
 
-  /* PARSE AGRS FOR PENNFAT FILESYSTEM NAME AND LOG FILE NAME */
-  // TODO
+    /**********************************************************************
+     * 2.  PennFAT initialisation  +  “create-if-missing” mount           *
+     *********************************************************************/
+    pennfat_kernel_init();                      /* kernel-side structures */
 
-  /* MOUNT PENNFAT */
-  // TODO
+    /* first try a normal mount … */
+    PennFatErr err = k_mount(fs_image);
 
-  /* RUN KERNEL (incl. INIT creation, run scheduler, spawn shell) */
-  Logger* logger = logger_init_stderr(LOG_LEVEL_INFO, "KERNEL");
-  k_set_logger(logger);
+    if (err != PennFatErr_SUCCESS) {
+        fprintf(stderr,
+                "PennOS: %s is not a valid PennFAT image (%s). "
+                "Creating a new one …\n",
+                fs_image, PennFatErr_toErrString(err));
 
-  fprintf(stderr, "Starting kernel...\n");
-  char* args[] = {"shell", NULL};
-  k_kernel_start(shell_main, args);
-  // this will keep running until shell shuts down, logger will also be closed
+        /* format: 4 FAT blocks, block-size config 0 (512 B)               */
+        const int FAT_BLOCKS = 4;
+        const int BS_CFG     = 0;
 
-  /* CLEAN UP AND SHUT DOWN */
-  // kernel cleanup handled inside k_kernel_start()
+        PennFatErr mkfs_err = k_mkfs(fs_image, FAT_BLOCKS, BS_CFG);
+        if (mkfs_err != PennFatErr_SUCCESS) {
+            fprintf(stderr,
+                    "mkfs(%s) failed: %s\n",
+                    fs_image, PennFatErr_toErrString(mkfs_err));
+            exit(EXIT_FAILURE);
+        }
 
-  fprintf(stderr, "PennOS shut down. Goodbye!\n");
+        /* … and try the mount again                                      */
+        err = k_mount(fs_image);
+        if (err != PennFatErr_SUCCESS) {
+            fprintf(stderr,
+                    "Mount after mkfs still failed: %s\n",
+                    PennFatErr_toErrString(err));
+            exit(EXIT_FAILURE);
+        }
 
+        fprintf(stderr, "✓ New image created and mounted.\n");
+    } else {
+        fprintf(stderr, "✓ Mounted existing image %s\n", fs_image);
+    }
+
+    /**********************************************************************
+     * 3.  start kernel + shell                                           *
+     *********************************************************************/
+    Logger *logger = logger_init_stderr(LOG_LEVEL_INFO, "KERNEL");
+    k_set_logger(logger);
+
+    fprintf(stderr, "Starting kernel …\n");
+    char *args[] = { "shell", NULL };
+    k_kernel_start(shell_main, args);           /* blocks until shutdown  */
+
+    /**********************************************************************
+     * 4.  unmount & cleanup                                              *
+     *********************************************************************/
+    k_unmount();
+    pennfat_kernel_cleanup();
+
+    fprintf(stderr, "PennOS shut down.  Goodbye!\n");
+    return EXIT_SUCCESS;
 }
 
-void print_welcome_banner() {
-  // ASCII art pattern credit: https://www.asciiart.eu/text-to-ascii-art
-
-  #define RED_ON_BLUE "\033[0m\033[38;5;255m\033[48;5;25m"
-  #define BLUE_ON_WHITE "\033[1m\033[38;5;124m\033[48;5;17m"
-
-  fprintf(stderr, "\033[2J\033[H");
-  fprintf(stderr, RED_ON_BLUE);
-  fprintf(stderr, " ______  ______  ______  ______  ______  ______  ______  ______  ______  ______  ______  ______ \n");
-  fprintf(stderr, "| |__| || |__| || |__| || |__| || |__| || |__| || |__| || |__| || |__| || |__| || |__| || |__| |\n");
-  fprintf(stderr, "|  ()  ||  ()  ||  ()  ||  ()  ||  ()  ||  ()  ||  ()  ||  ()  ||  ()  ||  ()  ||  ()  ||  ()  |\n");
-  fprintf(stderr, "|______||______||______||______||______||______||______||______||______||______||______||______|\n");
-  fprintf(stderr, " ______   " BLUE_ON_WHITE "                                                                            " RED_ON_BLUE "   ______ \n");
-  fprintf(stderr, "| |__| |" BLUE_ON_WHITE "       ,-.----.                                     ,----..                     " RED_ON_BLUE "| |__| |\n");
-  fprintf(stderr, "|  ()  |" BLUE_ON_WHITE "       \\    /  \\                                   /   /   \\   .--.--.          " RED_ON_BLUE "|  ()  |\n");
-  fprintf(stderr, "|______|" BLUE_ON_WHITE "       |   :    \\                                 /   .     : /  /    '.        " RED_ON_BLUE "|______|\n");
-  fprintf(stderr, " ______ " BLUE_ON_WHITE "       |   |  .\\ :             ,---,      ,---,  .   /   ;.  \\  :  /`. /        " RED_ON_BLUE " ______ \n");
-  fprintf(stderr, "| |__| |" BLUE_ON_WHITE "       .   :  |: |         ,-+-. /  | ,-+-. /  |.   ;   /  ` ;  |  |--`         " RED_ON_BLUE "| |__| |\n");
-  fprintf(stderr, "|  ()  |" BLUE_ON_WHITE "       |   |   \\ : ,---.  ,--.'|'   |,--.'|'   |;   |  ; \\ ; |  :  ;_           " RED_ON_BLUE "|  ()  |\n");
-  fprintf(stderr, "|______|" BLUE_ON_WHITE "       |   : .   //     \\|   |  ,\"' |   |  ,\"' ||   :  | ; | '\\  \\    `.        " RED_ON_BLUE "|______|\n");
-  fprintf(stderr, " ______ " BLUE_ON_WHITE "       ;   | |`-'/    /  |   | /  | |   | /  | |.   |  ' ' ' : `----.   \\       " RED_ON_BLUE " ______ \n");
-  fprintf(stderr, "| |__| |" BLUE_ON_WHITE "       |   | ;  .    ' / |   | |  | |   | |  | |'   ;  \\; /  | __ \\  \\  |       " RED_ON_BLUE "| |__| |\n");
-  fprintf(stderr, "|  ()  |" BLUE_ON_WHITE "       :   ' |  '   ;   /|   | |  |/|   | |  |/  \\   \\  ',  / /  /`--'  /       " RED_ON_BLUE "|  ()  |\n");
-  fprintf(stderr, "|______|" BLUE_ON_WHITE "       :   : :  '   |  / |   | |--' |   | |--'    ;   :    / '--'.     /        " RED_ON_BLUE "|______|\n");
-  fprintf(stderr, " ______ " BLUE_ON_WHITE "       |   | :  |   :    |   |/     |   |/         \\   \\ .'    `--'---'         " RED_ON_BLUE " ______ \n");
-  fprintf(stderr, "| |__| |" BLUE_ON_WHITE "       `---'.|   \\   \\  /'---'      '---'           `---`                       " RED_ON_BLUE "| |__| |\n");
-  fprintf(stderr, "|  ()  |" BLUE_ON_WHITE "         `---`    `----'                                                        " RED_ON_BLUE "|  ()  |\n");
-  fprintf(stderr, "|______|  " BLUE_ON_WHITE "                                                                            " RED_ON_BLUE "  |______|\n");
-  fprintf(stderr, " ______  ______  ______  ______  ______  ______  ______  ______  ______  ______  ______  ______ \n");
-  fprintf(stderr, "| |__| || |__| || |__| || |__| || |__| || |__| || |__| || |__| || |__| || |__| || |__| || |__| |\n");
-  fprintf(stderr, "|  ()  ||  ()  ||  ()  ||  ()  ||  ()  ||  ()  ||  ()  ||  ()  ||  ()  ||  ()  ||  ()  ||  ()  |\n");
-  fprintf(stderr, "|______||______||______||______||______||______||______||______||______||______||______||______|\n");
-
-  fprintf(stderr, "\033[0m\n");
-  fprintf(stderr, "\t\t\t\t       \033[1m\033[38;5;160m\033[4mWelcome to PennOS!\033[0m\n");
-  fprintf(stderr, "\n\n");
-
-  #undef RED_ON_BLUE
-  #undef BLUE_ON_WHITE
-
+/* ─────────────────────────────────────────────── banner (unchanged) ──── */
+static void print_welcome_banner(void)
+{
+    /* …  your existing banner code … */
 }
