@@ -352,7 +352,6 @@ void* shell_main(void* arg) {
   while (!exit_shell) {
     free(cmd);
 
-    fprintf(stderr, "DBG[shell]: top-of-loop\n");
     fprintf(stderr, PROMPT);
     cmd = read_command();
     if (!cmd || cmd->num_commands == 0) continue;
@@ -400,7 +399,6 @@ if (cmd->stdout_file) {
       s_tcsetpid(child_pid);
       s_waitpid(child_pid, NULL, false);
       s_tcsetpid(shell_pgid);
-      fprintf(stderr, "DBG[shell]: fg pid %d finished\n", child_pid);
     } else {
       /* TODO: store background job info */
 
@@ -662,10 +660,6 @@ static struct parsed_command* read_command() {
     fprintf(stderr, "\033[1m");
     bytes_read = read(STDIN_FILENO, buf, buf_len - 1);
     fprintf(stderr, "\033[0m");
-  
-    fprintf(stderr,
-            "DBG[read_cmd]: read() → %zd  errno=%d\n",
-            (ssize_t)bytes_read, (bytes_read < 0) ? errno : 0);
 
   if (bytes_read >= 0) {
     buf[bytes_read] = '\0';

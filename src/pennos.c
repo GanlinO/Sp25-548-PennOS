@@ -73,7 +73,6 @@ int main(int argc, char *argv[])
         /* start kernel – its own INIT (PID 1) will run shell_main() */
         k_kernel_start(shell_main, NULL);            /* blocks until shutdown  */
 
-    fprintf(stderr, "DBG[kernel]: k_kernel_start() returns\n");
     /**********************************************************************
      * 4.  unmount & cleanup                                              *
      *********************************************************************/

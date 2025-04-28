@@ -356,7 +356,6 @@ sigdelset(&suspend_set, SIGTSTP);
                         "kernel_scheduler lock (bottom-of-loop)");
 
   }
-  fprintf(stderr, "DBG[sched]: shutdown flag observed – leaving loop\n");
 
   /* drop the lock we still hold when we break out of the loop */
   assert_non_negative(pthread_mutex_unlock(&shutdown_mtx),
@@ -446,9 +445,7 @@ static void* init_routine(void* arg)
 {
     logger_log(logger, LOG_LEVEL_DEBUG, "INIT routine started");
 
-    fprintf(stderr, "DBG[cleanup]: here6.1\n");
     assert_non_null(arg, "Arg null for init_routine");
-    fprintf(stderr, "DBG[cleanup]: here6.2\n");
 
 
     starting_shell_args_t* args_to_init = (starting_shell_args_t*)arg;
@@ -458,11 +455,11 @@ static void* init_routine(void* arg)
         create_pcb(get_new_pid(),           /* get a fresh PID       */
                    args_to_init->init_pcb); /* parent = INIT         */
 
-                   fprintf(stderr, "DBG[cleanup]: here6.3\n");
+                   
     assert_non_null(starting_shell_pcb,
                     "Created shell PCB is null in init_routine");
 
-                    fprintf(stderr, "DBG[cleanup]: here6.4\n");
+                   
 
     /* top priority for the interactive shell                        */
     starting_shell_pcb->priority = PRIORITY_1;
@@ -472,17 +469,16 @@ static void* init_routine(void* arg)
     set_pcb_at_pid(starting_shell_pid, starting_shell_pcb);
     /* leave the exit-wrapper in place so PCB bookkeeping happens */
 
-    fprintf(stderr, "DBG[cleanup]: here6.5\n");
+ 
     set_routine_and_run_helper(starting_shell_pcb,
                                  args_to_init->shell_func,
                                  args_to_init->shell_arg,
                                  true  /* wrap_exit */);
 
-                                 fprintf(stderr, "DBG[cleanup]: here6.6\n");
+                                 
 
     free(arg);
 
-    fprintf(stderr, "DBG[cleanup]: here6.7\n");
 
     /* give the shell terminal control */
     term_ctrl_pid = starting_shell_pid;
@@ -493,9 +489,7 @@ static void* init_routine(void* arg)
     /* ───── wait until the shell terminates ──────────────────────── */
     while (true) {
       errno = 0;
-      fprintf(stderr, "DBG[INIT]: before k_waitpid\n");
       pid_t waited = k_waitpid(-1, NULL, true);   /* NOHANG = true        */
-      fprintf(stderr, "DBG[INIT]: after k_waitpid\n");
       
       if (waited == starting_shell_pid)
           break;                                  /* shell reaped         */
@@ -510,7 +504,6 @@ static void* init_routine(void* arg)
 
     logger_log(logger, LOG_LEVEL_DEBUG, "INIT triggering shutdown");
     k_shutdown();
-    fprintf(stderr, "DBG[INIT]: k_shutdown() returned\n");   /* <-- here */
 
     /* mark our own PCB as ZOMBIED and leave the scheduler a corpse to reap */
     k_exit();                                     /* never returns */
@@ -527,12 +520,10 @@ static void* init_routine(void* arg)
   {
       logger_log(logger, LOG_LEVEL_DEBUG, "cleanup started");
   
-      fprintf(stderr, "DBG[cleanup]: before calling spthread_self\n");
 
       spthread_t self;
       bool am_sp = spthread_self(&self);
 
-      fprintf(stderr, "DBG[cleanup]: before for loop\n");  
   
       for (size_t i = 0; i < vec_len(&all_prcs); ++i) {
           pcb_t *p = vec_get(&all_prcs, i);
@@ -541,27 +532,24 @@ static void* init_routine(void* arg)
           spthread_cancel_and_join(p->spthread);
       }
   
-      fprintf(stderr, "DBG[cleanup]: after joins\n");           /* ➊ */
   
       vec_destroy(&blocked_prcs);
-      fprintf(stderr, "DBG[cleanup]: blocked_prcs destroyed\n");/* ➋ */
   
       vec_destroy(&pending_sig_prcs);
-      fprintf(stderr, "DBG[cleanup]: pending_sig_prcs destroyed\n");/* ➌ */
   
       for (schedule_priority i = PRIORITY_1; i < PRIORITY_COUNT; ++i) {
           vec_destroy(&ready_prcs_queues[i]);
-          fprintf(stderr, "DBG[cleanup]: ready_q[%d] destroyed\n", i);/* ➍ */
+        
       }
   
       vec_destroy(&all_prcs);
-      fprintf(stderr, "DBG[cleanup]: all_prcs destroyed\n");    /* ➎ */
+      
   
       pthread_mutex_destroy(&shutdown_mtx);
-      fprintf(stderr, "DBG[cleanup]: mutex destroyed\n");       /* ➏ */
+      
   
       logger_close(logger);
-      fprintf(stderr, "DBG[cleanup]: logger closed – leaving cleanup\n");/* ➐ */
+      
   }
   
 
@@ -1187,20 +1175,13 @@ static void register_blocked_state(pcb_t* pcb) {
 static void spthread_cancel_and_join(spthread_t t)
 {
     /* pthread_t is opaque; cast to void * for %p */
-    fprintf(stderr,
-            "DBG[cleanup]: cancelling thread %p\n", (void *)t.thread);
 
     spthread_cancel(t);          /* set the cancellation flag            */
     spthread_continue(t);        /* make sure it is running              */
     spthread_suspend(t);         /* … and block until it hits a checkpoint */
 
-    fprintf(stderr,
-            "DBG[cleanup]: join thread %p …\n", (void *)t.thread);
-
     spthread_join(t, NULL);      /* reap resources                       */
 
-    fprintf(stderr,
-            "DBG[cleanup]: joined thread %p\n", (void *)t.thread);
 }
 
 /**
@@ -1435,7 +1416,6 @@ void k_kernel_start(void* (*starting_shell)(void*), void* arg) {
   kernel_scheduler();
 
   process_control_cleanup();
-  fprintf(stderr, "DBG[kernel]: k_kernel_start() returns\n");
 }
 
 pcb_t* k_proc_create(pcb_t* parent) {
@@ -1473,20 +1453,18 @@ void k_proc_cleanup(pcb_t* proc) {
     return;
   }
 
-  fprintf(stderr, "DBG[cleanup]: calling k_proc_cleanup()\n"); 
   /* join only once, ignore if already joined */
   spthread_cancel_and_join(proc->spthread);
   proc->state = PROCESS_STATE_TERMINATED;
 
-  fprintf(stderr, "DBG[cleanup]: exited spthread_cancel_and_join\n");
   pcb_t* parent_pcb = proc->parent;
   if (parent_pcb) {
-    fprintf(stderr, "DBG[cleanup]: here1\n");
+    
     // remove from parent's child vec
     // assume waitable children has been cleaned up when it becomes zombie
     if (!remove_pcb_first_from_vec(proc, &parent_pcb->children)) {
       logger_log(logger, LOG_LEVEL_WARN, "Cannot find reaped child in k_waitpid");
-      fprintf(stderr, "DBG[cleanup]: here2\n");
+      
     }
   } else {
     logger_log(logger, LOG_LEVEL_WARN, "Parent PCB null in k_proc_cleanup");
@@ -1494,17 +1472,17 @@ void k_proc_cleanup(pcb_t* proc) {
 
   // double check whether all children has gone (been adopted previously)
   if (vec_len(&proc->children) > 0 || vec_len(&proc->waitable_children) > 0) {
-    fprintf(stderr, "DBG[cleanup]: here3\n");
+    
     logger_log(logger, LOG_LEVEL_WARN, "Unadopted orphan found in k_waitpid");
     init_adopt_children(proc);
-    fprintf(stderr, "DBG[cleanup]: here4\n");
+    
   }
   
   // remove the pcb from all_prcs, which will automatically destruct the PCB
   pid_t my_pid = proc->pid;
   logger_log(logger, LOG_LEVEL_DEBUG, "Setting all_prcs for PID %d to NULL", my_pid);
   set_pcb_at_pid(my_pid, NULL);
-  fprintf(stderr, "DBG[cleanup]: here5\n");
+  
 
 }
 
@@ -1572,7 +1550,7 @@ pid_t k_waitpid(pid_t pid, int* wstatus, bool nohang) {
       // if waited child has terminated (zombie), reap it
       if (waited_child->state == PROCESS_STATE_ZOMBIED) {
         k_proc_cleanup(waited_child);
-        fprintf(stderr, "DBG[cleanup]: here6\n");
+        
       }
 
       return waited_child_pid;
