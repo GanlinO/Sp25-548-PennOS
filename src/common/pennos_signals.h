@@ -16,5 +16,9 @@ typedef enum signal_value {
 #define P_SIG_ADDSIG(sigset, signo) ((sigset) | P_SIG_FLAG(signo))
 #define P_SIG_HASSIG(sigset, signo) (((sigset) & P_SIG_FLAG(signo)) != 0)
 
+#define P_WIFEXITED(st)    ((st) == 0)            /* normal return / s_exit   */
+#define P_WIFSTOPPED(st)   ((st) == P_SIGSTOP)    /* became stopped           */
+#define P_WIFSIGNALED(st)  ((st) == P_SIGTERM)    /* killed by P_SIGTERM      */
+
 
 #endif  // PENNOS_SIGNALS_H_

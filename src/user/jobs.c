@@ -36,9 +36,9 @@ static void chld_handler(int _unused)
         int idx = index_by_pid(pid);
         if (idx < 0) continue;           /* unknown child                */
 
-        if      (status == P_SIGSTOP) table[idx].state = JOB_STOPPED;
-        else if (status == P_SIGCONT) table[idx].state = JOB_RUNNING;
-        else                          table[idx].state = JOB_DONE;
+        if      (P_WIFSTOPPED(status))         table[idx].state = JOB_STOPPED;
+        else if (status == P_SIGCONT)          table[idx].state = JOB_RUNNING;
+        else /* exited or signalled */        table[idx].state = JOB_DONE;
 
         if (idx == fg_index && table[idx].state != JOB_RUNNING)
             fg_index = -1;
