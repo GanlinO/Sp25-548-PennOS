@@ -653,11 +653,9 @@ static struct parsed_command* read_command() {
   // read user input
   ssize_t bytes_read;
 
-  // fprintf(stderr, "\033[1m");
-  // bytes_read = read(STDIN_FILENO, buf, buf_len - 1);
-  // fprintf(stderr, "\033[0m");
 
     fprintf(stderr, "\033[1m");
+    errno = 0;                                       /* keep EINTR       */
     bytes_read = read(STDIN_FILENO, buf, buf_len - 1);
     fprintf(stderr, "\033[0m");
 

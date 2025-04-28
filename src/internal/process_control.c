@@ -107,6 +107,8 @@ typedef struct starting_shell_args_t {
 // the flag for checking if the kernel has started, before the attempt to create other process
 static bool kernel_started = false;
 
+static pid_t shell_pid = -1; /* set in create_init() */
+
 // the flag to indicate that the scheduler should be shut down
 static bool shutdown;
 // the mutex to protect shutdown
@@ -384,11 +386,10 @@ static void process_control_initialize() {
   flag_sigtstp = false;
   term_ctrl_pid = 0;
 
-  // register SIGINT and SIGTSTP handlers
-  struct sigaction act = (struct sigaction){
-    .sa_handler = async_sig_handler,
-    .sa_flags = SA_RESTART,
-  };
+   struct sigaction act = (struct sigaction){
+        .sa_handler = async_sig_handler,
+        .sa_flags   = 0,               /* let syscalls be interrupted      */
+      };
   sigaction(SIGINT, &act, NULL);
   sigaction(SIGTSTP, &act, NULL);
 
@@ -465,6 +466,7 @@ static void* init_routine(void* arg)
     starting_shell_pcb->priority = PRIORITY_1;
 
     const pid_t starting_shell_pid = starting_shell_pcb->pid;
+    shell_pid = starting_shell_pid;        /* for SIGINT special-case */
 
     set_pcb_at_pid(starting_shell_pid, starting_shell_pcb);
     /* leave the exit-wrapper in place so PCB bookkeeping happens */
@@ -487,12 +489,14 @@ static void* init_routine(void* arg)
         set_process_name(starting_shell_pcb, "SHELL");
 
     /* ───── wait until the shell terminates ──────────────────────── */
+    int st;
     while (true) {
       errno = 0;
-      pid_t waited = k_waitpid(-1, NULL, true);   /* NOHANG = true        */
+      pid_t waited = k_waitpid(-1, &st, true);    /* NOHANG = true */
       
-      if (waited == starting_shell_pid)
-          break;                                  /* shell reaped         */
+      if (waited == starting_shell_pid &&
+                    (P_WIFEXITED(st) || P_WIFSIGNALED(st))) /* only EXIT/TERM */
+                    break;                                  /* shell ended    */
 
   
       if (waited == -1 && errno == ECHILD)        /* POSIX style          */
@@ -567,7 +571,7 @@ if (term_ctrl_pid != INIT_PID) {
   pcb_t *p = get_pcb_at_pid(term_ctrl_pid);
   if (p) {
       if (flag_sigint)
-          p->pending_signals = P_SIG_ADDSIG(p->pending_signals, P_SIGTERM);
+      p->pending_signals = P_SIG_ADDSIG(p->pending_signals, P_SIGINT);
       if (flag_sigtstp)
           p->pending_signals = P_SIG_ADDSIG(p->pending_signals, P_SIGSTOP);
         
@@ -637,6 +641,32 @@ static void handle_pending_signals() {
       continue;
     }
 
+        /* ---------- Ctrl-C (interrupt) ---------- */
+    if (P_SIG_HASSIG(sigset, P_SIGINT)) {
+        /* 1.  If the shell itself is in the foreground, ignore the SIGINT
+         *     (just wakes its read() so it prints a new prompt).          */
+                if (proc->pid == shell_pid) {
+                      proc->pending_signals = P_SIG_DELSIG(proc->pending_signals,
+                                                           P_SIGINT);
+                      goto next_proc;                 /* <<<  skip bookkeeping     */
+                  }
+        /* 2.  Any *other* foreground job: translate to SIGTERM, then let
+         *     the existing SIGTERM handler below do the heavy lifting.   */
+        proc->pending_signals =
+            P_SIG_DELSIG(proc->pending_signals, P_SIGINT);
+        proc->pending_signals =
+            P_SIG_ADDSIG(proc->pending_signals, P_SIGTERM);
+        sigset = proc->pending_signals;     /* update local copy          */
+      }
+
+          /* ---------- Ctrl-Z (interactive shell ignores) ---------- */
+    if (proc->pid == shell_pid && P_SIG_HASSIG(sigset, P_SIGSTOP)) {
+          /* Wake its read() (EINTR) but do NOT change its state */
+          proc->pending_signals =
+                  P_SIG_DELSIG(proc->pending_signals, P_SIGSTOP);
+          goto next_proc;          /* skip the normal STOP bookkeeping */
+      }
+
     // note: if both P_SIGSTOP and P_SIGCONT are received, P_SIGSTOP will prevail (as Linux does)
     if (P_SIG_HASSIG(sigset, P_SIGSTOP)) {
       logger_log(logger, LOG_LEVEL_DEBUG, "Process P_SIGSTOP for PID[%d]", proc->pid);
@@ -657,9 +687,6 @@ static void handle_pending_signals() {
       // blocked list do not need to be checked as a process stays in the blocked list if both blocked and stopped
 
       proc->waitpid_stat = P_SIGSTOP;
-      if (proc->parent) {
-        vec_push_back(&proc->parent->waitable_children, proc);
-      }
 
       proc->state = PROCESS_STATE_STOPPED;
       stopcont_event_log(proc, "STOPPED");   // blocked process will also be marked stopped
@@ -697,10 +724,15 @@ static void handle_pending_signals() {
       }
     }
 
-    if (proc->parent) {
-      vec_push_back(&proc->parent->waitable_children, proc);
+        /* notify the parent only for state–changing signals             */
+    if ((P_SIG_HASSIG(sigset, P_SIGTERM) ||
+         P_SIG_HASSIG(sigset, P_SIGSTOP) ||
+         P_SIG_HASSIG(sigset, P_SIGCONT)) &&
+        proc->parent) {
+        vec_push_back(&proc->parent->waitable_children, proc);
     }
     proc->pending_signals = 0;
+    next_proc: ;
   }
 
   vec_clear(&pending_sig_prcs);
@@ -1113,7 +1145,11 @@ static void init_adopt_children(pcb_t* pcb) {
     return;
   }
 
-  pcb_t* init_pcb = get_pcb_at_pid(INIT_PID);
+      /* If pcb **is already** INIT, there is nobody to adopt from.       */
+    pcb_t *init_pcb = get_pcb_at_pid(INIT_PID);
+    if (pcb == init_pcb)
+        return;
+
   assert_non_null(init_pcb, "INIT PCB not found in init_adopt_children");
 
   for (size_t i = 0; i < vec_len(&pcb->children); ++i) {
