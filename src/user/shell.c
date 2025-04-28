@@ -24,10 +24,10 @@ void* logout_cmd(void*);
 void* touch(void* arg);
 void* ls(void* arg);
 void* cat(void* arg);
-void* chmod_file(void* arg);
-void* cp_file(void* arg);      /* NEW */
-void* mv_file(void* arg);      /* NEW */
-void* rm_file(void* arg);      /* NEW */
+void* chmod(void* arg);
+void* cp(void* arg);      /* NEW */
+void* mv(void* arg);      /* NEW */
+void* rm(void* arg);      /* NEW */
 void* kill_cmd(void* arg);     /* renamed to avoid clash          */
 
 
@@ -42,7 +42,10 @@ typedef struct cmd_func_match_t{
   thd_func_t  func;
 } cmd_func_match_t;
 
-/*  independent (straight-line) built-ins – run *inside* shell  */
+/* ───────────────────────────────────────────────
+ *  built-ins that MUST run in a *separate* PennOS
+ *  process (section 3.1 first table)
+ * ───────────────────────────────────────────────*/
 static cmd_func_match_t independent_funcs[] = {
   {"ps",        ps},
   {"echo",      echo},
@@ -50,28 +53,38 @@ static cmd_func_match_t independent_funcs[] = {
   {"touch",     touch},        /* NEW */
   {"ls",        ls},           /* NEW */
   {"cat",       cat},          /* NEW */
-  {"chmod",     chmod_file},   /* NEW – name differs from syscall chmod(2) */
+  {"chmod",     chmod},   
   {"zombify",   zombify},
   {"orphanify", orphanify},
   {"busy",      busy},
   {"kill",      kill_cmd},     /* renamed                        */
-  {"man",       man},
-  {"cp",        cp_file},      /* NEW – data-moving              */
-  {"mv",        mv_file},      /* NEW – data-moving              */
-  {"rm",        rm_file},      /* NEW – data-moving              */
-  {"jobs",      jobs_builtin},
-  {"bg",        bg},
-  {"fg",        fg},
-  {"logout",    logout_cmd},
+    {"cp",        cp},
+  {"mv",        mv},
+  {"rm",        rm},
   {NULL, NULL}
 };
+
+/* ───────────────────────────────────────────────
+ *  built-ins that run **inside the shell**
+ *  (section 3.1 “sub-routine” table)
+ * ───────────────────────────────────────────────*/
+static cmd_func_match_t inline_funcs[] = {
+    {"nice",      u_nice},
+    {"nice_pid",  u_nice_pid},
+    {"man",       man},
+    {"jobs",      jobs_builtin},
+    {"bg",        bg},
+    {"fg",        fg},
+    {"logout",    logout_cmd},
+    {NULL, NULL}
+  };
 
 /*──────────────────────────────────────────────────────────────*/
 /*          MAIN PROGRAM (existing content remains)             */
 /*──────────────────────────────────────────────────────────────*/
 
 #define INITIAL_BUF_LEN (4096)
-#define PROMPT "\033[1m\033[36mPennOS > \033[0m"
+#define PROMPT "$ "
 
 static char* buf = NULL;
 static int   buf_len = 0;
@@ -94,10 +107,10 @@ static void debug_print_argv(char** argv);
 static void debug_print_parsed_command(struct parsed_command*);
 #endif
 
-static int open_for_read (const char *path)               { return k_open(path, K_O_RDONLY); }
+static int open_for_read (const char *path)               { return s_open(path, K_O_RDONLY); }
 static int open_for_write(const char *path, bool append)  {
   int flags = K_O_CREATE | (append ? K_O_APPEND : K_O_WRONLY);
-  return k_open(path, flags);
+  return s_open(path, flags);
 }
 
 static pid_t spawn_stage(char **argv, int fd_in, int fd_out);
@@ -116,7 +129,7 @@ void* touch(void* arg)
     return NULL;
   }
   for (int i = 1; argv[i]; ++i) {
-    PennFatErr err = k_touch(argv[i]);
+    PennFatErr err = s_touch(argv[i]);
     if (err) fprintf(stderr, "touch: %s: %s\n", argv[i],
                      PennFatErr_toErrString(err));
   }
@@ -127,40 +140,55 @@ void* touch(void* arg)
 void* ls(void* arg)
 {
   (void)arg;          /* unused */
-  PennFatErr err = k_ls(NULL);
+  PennFatErr err = s_ls(NULL);
   if (err) fprintf(stderr, "ls: %s\n", PennFatErr_toErrString(err));
   return NULL;
 }
 
 /* ---------- chmod ---------- */
-static uint8_t parse_perm_string(const char* s)
+/**
+ * Translate a symbolic permission string to a bit-mask.
+ * Accepts:  "rwx", "+rw", "-x", etc.  The leading ‘+’/‘-’ is ignored – we
+ * presently treat the request as an *absolute* mask because the underlying
+ * s_chmod() overwrites the whole permission set.
+ * Returns 0xFF on syntax error.
+ */
+static uint8_t parse_perm_string(const char *s)
 {
-  uint8_t p = 0;
-  for (; *s; ++s) {
-    if (*s=='r') p |= PERM_READ;
-    else if (*s=='w') p |= PERM_WRITE;
-    else if (*s=='x') p |= PERM_EXEC;
-    else return 0xFF;          /* invalid */
-  }
-  return p;
+    if (!s) return 0xFF;
+    if (*s == '+' || *s == '-')            /* optional sign */ ++s;
+
+    uint8_t m = 0;
+    for (; *s; ++s) {
+        if      (*s == 'r') m |= PERM_READ;
+        else if (*s == 'w') m |= PERM_WRITE;
+        else if (*s == 'x') m |= PERM_EXEC;
+        else                return 0xFF;   /* illegal character */
+    }
+    return (m == 0) ? 0xFF : m;
 }
 
-void* chmod_file(void* arg)
+void* chmod(void* arg)
 {
   char** argv = (char**)arg;
   if (!argv || !argv[1] || !argv[2]) {
-    fprintf(stderr, "chmod: usage: chmod PERMS FILE …\n");
-    return NULL;
+      fprintf(stderr, "chmod: usage: chmod PERMS FILE …\n");
+      return NULL;
   }
+
+  /* parse the +rwx / -wx … string **once** */
   uint8_t perm = parse_perm_string(argv[1]);
   if (perm == 0xFF) {
-    fprintf(stderr, "chmod: invalid permission string '%s'\n", argv[1]);
-    return NULL;
+      fprintf(stderr, "chmod: invalid permission string '%s'\n", argv[1]);
+      return NULL;
   }
+
+  /* try to apply it to every remaining operand */
   for (int i = 2; argv[i]; ++i) {
-    PennFatErr err = k_chmod(argv[i], perm);
-    if (err) fprintf(stderr, "chmod: %s: %s\n", argv[i],
-                     PennFatErr_toErrString(err));
+      PennFatErr err = s_chmod(argv[i], perm);
+      if (err)
+          fprintf(stderr, "chmod: %s: %s\n",
+                  argv[i], PennFatErr_toErrString(err));
   }
   return NULL;
 }
@@ -169,27 +197,33 @@ void* chmod_file(void* arg)
 #define CAT_BUFSZ 4096
 void* cat(void* arg)
 {
-  char** argv = (char**)arg;
+    char** argv = (char**)arg;
+  /* No file names → echo STDIN until EOF --------------------------- */
   if (!argv || !argv[1]) {
-    fprintf(stderr, "cat: missing file operand\n");
-    return NULL;
+      char buf[CAT_BUFSZ];
+      while (1) {
+          PennFatErr n = s_read(STDIN_FILENO, CAT_BUFSZ, buf);
+          if (n <= 0) break;
+          fwrite(buf, 1, n, stdout);
+      }
+      return NULL;
   }
   char buf[CAT_BUFSZ];
 
   for (int i = 1; argv[i]; ++i) {
-    int fd = k_open(argv[i], K_O_RDONLY);
+    int fd = s_open(argv[i], K_O_RDONLY);
     if (fd < 0) {
       fprintf(stderr, "cat: %s: %s\n", argv[i],
               PennFatErr_toErrString(fd));
       continue;
     }
     while (1) {
-      PennFatErr r = k_read(fd, CAT_BUFSZ, buf);
+      PennFatErr r = s_read(fd, CAT_BUFSZ, buf);
       if (r < 0) { fprintf(stderr, "cat: read error\n"); break; }
       if (r == 0) break;
       fwrite(buf, 1, r, stdout);
     }
-    k_close(fd);
+    s_close(fd);
   }
   return NULL;
 }
@@ -264,7 +298,7 @@ void* man(void* arg)
 /*======================================================================*/
 
 /* cp  SRC DST  — copy a file inside PennFAT (no host –h support yet) */
-void* cp_file(void* arg)
+void* cp(void* arg)
 {
   char** argv = (char**)arg;
   if (!argv || !argv[1] || !argv[2]) {
@@ -275,36 +309,36 @@ void* cp_file(void* arg)
   const char* src = argv[1];
   const char* dst = argv[2];
 
-  int src_fd = k_open(src, K_O_RDONLY);
+  int src_fd = s_open(src, K_O_RDONLY);
   if (src_fd < 0) {
     fprintf(stderr, "cp: cannot open %s\n", src);
     return NULL;
   }
-  int dst_fd = k_open(dst, K_O_CREATE | K_O_WRONLY);
+  int dst_fd = s_open(dst, K_O_CREATE | K_O_WRONLY);
   if (dst_fd < 0) {
     fprintf(stderr, "cp: cannot create %s\n", dst);
-    k_close(src_fd);
+    s_close(src_fd);
     return NULL;
   }
 
   char buf[4096];
   while (1) {
-    PennFatErr n = k_read(src_fd, sizeof buf, buf);
+    PennFatErr n = s_read(src_fd, sizeof buf, buf);
     if (n < 0) { fprintf(stderr, "cp: read error\n"); break; }
     if (n == 0) break;                 /* EOF */
-    if (k_write(dst_fd, buf, n) != n) {
+    if (s_write(dst_fd, buf, n) != n) {
       fprintf(stderr, "cp: write error\n");
       break;
     }
   }
 
-  k_close(src_fd);
-  k_close(dst_fd);
+  s_close(src_fd);
+  s_close(dst_fd);
   return NULL;
 }
 
 /* mv  SRC DST  — rename inside PennFAT */
-void* mv_file(void* arg)
+void* mv(void* arg)
 {
   char** argv = (char**)arg;
   if (!argv || !argv[1] || !argv[2]) {
@@ -312,13 +346,13 @@ void* mv_file(void* arg)
     return NULL;
   }
 
-  if (k_rename(argv[1], argv[2]) != 0)
+  if (s_rename(argv[1], argv[2]) != 0)
     fprintf(stderr, "mv: cannot rename %s -> %s\n", argv[1], argv[2]);
   return NULL;
 }
 
 /* rm  FILE…  — delete one or more files */
-void* rm_file(void* arg)
+void* rm(void* arg)
 {
   char** argv = (char**)arg;
   if (!argv || !argv[1]) {
@@ -327,7 +361,7 @@ void* rm_file(void* arg)
   }
 
   for (int i = 1; argv[i]; ++i) {
-    if (k_unlink(argv[i]) != 0)
+    if (s_unlink(argv[i]) != 0)
       fprintf(stderr, "rm: cannot remove %s\n", argv[i]);
   }
   return NULL;
@@ -350,11 +384,36 @@ void* shell_main(void* arg) {
   jobs_init();                                   /* step 6 */
 
   while (!exit_shell) {
+        /* ── 1. reap all dead children synchronously (NOHANG) ─────────── */
+    while (s_waitpid(-1, NULL, true) > 0)   /* discard status */
+        ;
+
     free(cmd);
 
     fprintf(stderr, PROMPT);
     cmd = read_command();
     if (!cmd || cmd->num_commands == 0) continue;
+
+       /* ─────────────────────────────────────────────────────────────
+    *  STEP ➊ : built-ins that must run *inside* the shell (nice,
+     *           bg, fg, jobs, logout, man, …).
+     *           If the first word of the command matches one of
+     *           those, execute it synchronously and go back to the
+     *           prompt – no pipes, no redirections, no child proc.     * ────────────────────────────────────────────────────────────*/
+    {
+          char **argv0 = cmd->commands[0];        /* words of 1st stage */
+          thd_func_t inl = get_func_from_cmd(argv0[0], inline_funcs);
+          if (inl) {               /* found a shell-local built-in */
+              inl(argv0);          /* run it right here            */
+              continue;            /* prompt user again            */
+          }
+      }
+  
+      /* ────────────────────────────────────────────────────────────
+       *  From here on we know the command is *not* shell-local, so
+       *  we treat it like an external pipeline: handle < > >> and
+       *  possibly create one or many child processes.
+       * ────────────────────────────────────────────────────────────*/
 
   /*----------------------------------------------*
  *  Handle <  >  >>  from the parsed structure  *
@@ -379,7 +438,7 @@ if (cmd->stdout_file) {
   int fd = open_for_write(cmd->stdout_file, cmd->is_file_append);
   if (fd < 0) {
     fprintf(stderr, "shell: cannot open %s (%s)\n", cmd->stdout_file, PennFatErr_toErrString(fd));
-    if (close_in) k_close(redir_in);
+    if (close_in) s_close(redir_in);
     goto AFTER_LOOP_CLEANUP;
   }
   redir_out = fd;  close_out = true;
@@ -404,8 +463,8 @@ if (cmd->stdout_file) {
 
     }
 
-    if (close_in)  k_close(redir_in);
-    if (close_out) k_close(redir_out);
+    if (close_in)  s_close(redir_in);
+    if (close_out) s_close(redir_out);
 
     AFTER_LOOP_CLEANUP:
     ;   /* empty statement so the label isn’t alone */
@@ -752,7 +811,7 @@ void* logout_cmd(void* arg)
 
 static int open_redirect(int *fd, const char *path, int flags)
 {
-    int newfd = k_open(path, flags);
+    int newfd = s_open(path, flags);
     if (newfd < 0) {
         fprintf(stderr, "shell: cannot open %s\n", path);
         return -1;
@@ -821,8 +880,8 @@ static pid_t process_one_command(char **cmdv[], size_t stages,
       if (first_pid == -1) first_pid = pid;
 
       /* parent closes ends it no longer needs */
-      if (prev_rd != STDIN_FILENO) k_close(prev_rd);
-      if (this_out != STDOUT_FILENO) k_close(this_out);
+      if (prev_rd != STDIN_FILENO) s_close(prev_rd);
+      if (this_out != STDOUT_FILENO) s_close(this_out);
 
       prev_rd = pipefds[0];  /* read end for next iteration (or dangling) */
   }

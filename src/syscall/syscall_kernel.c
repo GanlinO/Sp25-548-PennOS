@@ -1,6 +1,7 @@
 /* ─── src/syscall/syscall_kernel.c ───────────────────────────────────────── */
 #include "syscall_kernel.h"
 #include "../internal/process_control.h"
+// #include "../internal/pennfat_kernel.h"
 #include "../util/utils.h"
 #include <errno.h>
 #include <unistd.h>   // dup2, close
@@ -16,7 +17,7 @@ typedef struct spawn_wrapper_arg {
 } spawn_wrapper_arg;
 
 /* runs in the CHILD ─ before user “func” */
-static void *spawn_entry_wrapper(void *raw)
+void *spawn_entry_wrapper(void *raw)
 {
   spawn_wrapper_arg *wrap = (spawn_wrapper_arg *)raw;
 
@@ -133,3 +134,42 @@ int s_pipe(int fds[2])
     if (r < 0) errno = EMFILE;   /* may fine-tune later */
     return r;
 }
+
+/* ───────────────── PennFAT helpers ────────────────────────────────── */
+static void map_errno(PennFatErr e)
+{
+    switch (e) {
+        case PennFatErr_PERM:      errno = EACCES;   break;
+        case PennFatErr_NOTDIR:    errno = ENOTDIR;  break;
+        case PennFatErr_EXISTS:    errno = ENOENT;   break;
+        case PennFatErr_NOSPACE:   errno = ENOSPC;   break;
+        default:                   errno = EIO;      break;
+    }
+}
+
+/* thin 1-to-1 shims -------------------------------------------------- */
+int s_open(const char *p,int m){ int r=k_open(p,m);
+    if(r<0){ map_errno(r);} return r; }
+
+PennFatErr s_close(int fd){ return k_close(fd); }
+
+PennFatErr s_read (int fd,int n,char *b){ return k_read (fd,n,b); }
+PennFatErr s_write(int fd,const char *b,int n){ return k_write(fd,b,n); }
+
+PennFatErr s_touch(const char *p){ return k_touch(p); }
+PennFatErr s_ls   (const char *p){ return k_ls   (p); }
+PennFatErr s_chmod(const char *p,uint8_t perm){ return k_chmod(p,perm); }
+
+int s_rename(const char *o,const char *n){
+    PennFatErr r = k_rename(o,n);
+    if(r!=PennFatErr_OK){ map_errno(r); return -1; }
+    return 0;
+}
+
+int s_unlink(const char *p){
+    PennFatErr r = k_unlink(p);
+    if(r!=PennFatErr_OK){ map_errno(r); return -1; }
+    return 0;
+}
+
+

@@ -2,6 +2,19 @@
 #define SYSCALL_KERNEL_H_
 
 #include "../common/pennos_types.h"
+#include "../internal/pennfat_kernel.h"
+
+/* PennFAT wrappers --------------------------------------------------- */
+int         s_open (const char *path, int mode);
+PennFatErr  s_close(int fd);
+PennFatErr  s_read (int fd, int n, char *buf);
+PennFatErr  s_write(int fd, const char *buf, int n);
+
+PennFatErr  s_touch (const char *path);
+PennFatErr  s_ls    (const char *path /* or NULL = CWD */);
+PennFatErr  s_chmod (const char *path, uint8_t perm);
+int         s_rename(const char *oldp, const char *newp);   /* 0 / -1 */
+int         s_unlink(const char *path);                     /* 0 / -1 */
 
 /**
  * @brief Create a child process that executes the function `func`.

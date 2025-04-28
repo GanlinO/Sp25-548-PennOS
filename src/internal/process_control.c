@@ -17,6 +17,20 @@
  *    definitions   *
  ********************/
 
+/* ------------------------------------------------------------------+
+|  Child-wrapper built by s_spawn() (user land).  Kernel only needs  |
+|  to know the field offsets, so we duplicate the tiny definition    |
+|  here instead of including the user header (would introduce cycles)|
++-------------------------------------------------------------------*/
+struct spawn_wrapper_arg {
+  void *(*func)(void *);   /* child entry                            */
+  void  *real_arg;         /* original argv[]                        */
+  int    fd0;              /* inherited stdin  (or –1)               */
+  int    fd1;              /* inherited stdout (or –1)               */
+};
+
+void *spawn_entry_wrapper(void *raw);   /* symbol lives in user land */
+
 #define MAX_PID_NUMBER (65535)  // largest possible PID #
 #define INIT_PID (1)            // PID # of INIT
 
@@ -1036,6 +1050,7 @@ static routine_exit_wrapper_args_t* wrap_routine_exit_args(void* (*func)(void*),
   return wrapped_args;
 }
 
+
 /**
  * A helper function for k_set_routine_and_run
  */
@@ -1067,21 +1082,31 @@ static int set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), void* a
   }
   logger_log(logger, LOG_LEVEL_DEBUG, "Spthread created with thd routine for PID[%d]", proc->pid);
 
-  /* SET UP PROCESS NAME */
-char *process_name = NULL;
-if (proc->pid == INIT_PID) {
-    process_name = INIT_PROCESS_NAME;
+  /* ---------------------------------------------------------------
+   * Decide a human-readable command name BEFORE logging “CREATE”.
+   *  •  INIT                         →  "INIT"
+   *  •  regular spawn(argv)         →  argv[0]
+   *  •  spawn_wrapper_arg.real_arg  →  real_arg[0]
+   *  •  fallback                    →  "(unknown)"
+   * --------------------------------------------------------------*/
 
-    } else if (wrap_exit && arg) {       /* might be argv **            */
-          char **maybe_argv = (char **)arg;
-          if (maybe_argv &&
-              looks_like_cstring(maybe_argv[0]))      /* safe-guard      */
-              process_name = maybe_argv[0];
-          else
-              process_name = DEFAULT_PROCESS_NAME;
-} else {
-    process_name = DEFAULT_PROCESS_NAME;
-}
+  const char *process_name = DEFAULT_PROCESS_NAME;
+
+  if (proc->pid == INIT_PID) {
+      process_name = INIT_PROCESS_NAME;
+
+  /* case 1: ordinary wrap_exit where arg is **argv                     */
+  } else if (wrap_exit && arg &&
+             looks_like_cstring(((char **)arg)[0])) {
+      process_name = ((char **)arg)[0];
+
+  /* case 2: s_spawn() →  spawn_wrapper_arg                            */
+  } else if (func == spawn_entry_wrapper && arg) {
+    struct spawn_wrapper_arg *sw = (struct spawn_wrapper_arg *)arg;
+      char **maybe_argv = (char **)sw->real_arg;
+      if (maybe_argv && looks_like_cstring(maybe_argv[0]))
+          process_name = maybe_argv[0];
+  }
 set_process_name(proc, process_name);
 
   logger_log(logger, LOG_LEVEL_DEBUG, "Process name set for PID[%d]: %s", proc->pid, proc->process_name);
