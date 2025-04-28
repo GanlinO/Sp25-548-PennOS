@@ -4,8 +4,14 @@
 #include <signal.h>
 #include <string.h>
 #include <stdio.h>
+#include "../syscall/syscall_kernel.h"     /* s_spawn, s_kill, … */
 
 #define MAX_JOBS 64
+
+/* we *can* run with no extra helper – the SIGCHLD handler below does
+ * all the reaping.  Keep the variable so jobs_shutdown() can stay a
+ * no-op if nothing was started.                                           */
+static pid_t helper_pid = -1;
 
 static job_t table[MAX_JOBS];
 static int    next_jid = 1;
@@ -28,19 +34,22 @@ static int index_by_pid(pid_t pid)
 /* ───────── SIGCHLD handler ───────── */
 static void chld_handler(int _unused)
 {
-    int   status;
-    pid_t pid;
+    /* iterate over **known** jobs only                                */
+    for (int i = 0; i < MAX_JOBS; ++i) {
+        if (table[i].jid == 0)               /* slot unused           */
+            continue;
 
-    /* reap **all** children that changed state, but do NOT block      */
-    while ((pid = s_waitpid(-1, &status, false)) > 0) {
-        int idx = index_by_pid(pid);
-        if (idx < 0) continue;           /* unknown child                */
+        int   status;
+        pid_t pid = s_waitpid(table[i].pid, &status, true);  /* NOHANG */
+        if (pid <= 0)                       /* nothing new            */
+            continue;
 
-        if      (P_WIFSTOPPED(status))         table[idx].state = JOB_STOPPED;
-        else if (status == P_SIGCONT)          table[idx].state = JOB_RUNNING;
-        else /* exited or signalled */        table[idx].state = JOB_DONE;
+        /* we reaped a background/-pipeline job                       */
+        if      (P_WIFSTOPPED(status)) table[i].state = JOB_STOPPED;
+        else if (status == P_SIGCONT)   table[i].state = JOB_RUNNING;
+        else                            table[i].state = JOB_DONE;
 
-        if (idx == fg_index && table[idx].state != JOB_RUNNING)
+        if (i == fg_index && table[i].state != JOB_RUNNING)
             fg_index = -1;
     }
 }
@@ -55,6 +64,14 @@ void jobs_init(void)
     sa.sa_handler = chld_handler;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGCHLD, &sa, NULL);
+
+    helper_pid = -1;
+}
+
+void jobs_shutdown(void)             /* <-- new */
+{
+    if (helper_pid > 0)
+        s_kill(helper_pid, P_SIGTERM);   /* the worker simply returns   */
 }
 
 int jobs_add(pid_t pid, const char *cmdline, bool bg)

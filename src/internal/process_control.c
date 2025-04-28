@@ -41,10 +41,11 @@ typedef enum schedule_priority {
 } schedule_priority;
 
 typedef enum process_state {
-  PROCESS_STATE_READY = 1,    // running or waiting to be scheduled
-  PROCESS_STATE_STOPPED = 2,
-  PROCESS_STATE_BLOCKED = 3,
-  PROCESS_STATE_TERMINATED = 4,
+  PROCESS_STATE_READY     = 1,   // runnable (running or in ready-queue)
+  PROCESS_STATE_STOPPED   = 2,   // stopped by P_SIGSTOP
+  PROCESS_STATE_BLOCKED   = 3,   // sleeping or waiting
+  PROCESS_STATE_ZOMBIED   = 4,   // finished but not yet reaped
+  PROCESS_STATE_TERMINATED= 5,   // fully cleaned-up (never scheduled)
 } process_state;
 
 /**
@@ -187,14 +188,18 @@ static schedule_priority scheduler_get_next_priority();
 static void set_process_name(pcb_t* pcb, const char* process_name);
 static void process_deathbed(pcb_t* proc);
 
-static void schedule_event_log(pcb_t* proc, schedule_priority priority);
-static void lifecycle_event_log(pcb_t* proc, char* event_name, char* add_msg);
-
 static void init_adopt_children(pcb_t* pcb);
 static void register_blocked_state(pcb_t* pcb);
 
+static void schedule_event_log(pcb_t *p, schedule_priority q);
+static void lifecycle_event_log(pcb_t *p, const char *event, const char *extra);
+static void nice_event_log(pcb_t *p, int old_pri, int new_pri);
+static void block_event_log(pcb_t *p, const char *event);
+static void stopcont_event_log(pcb_t *p, const char *event);
+
 static bool remove_pcb_first_from_vec(pcb_t* pcb_ptr, Vec* vec);
 static int remove_pcb_all_from_vec(pcb_t* pcb_ptr, Vec* vec);
+static bool vec_contains_ptr(Vec *v, void *ptr);
 
 static void* routine_exit_wrapper_func(void* wrapped_args);
 static routine_exit_wrapper_args_t* wrap_routine_exit_args(void* (*func)(void*), char* argv[]);
@@ -240,11 +245,14 @@ static void kernel_scheduler() {
 
   logger_log(logger, LOG_LEVEL_DEBUG, "start kernel_scheduler");
 
-  // mask for while scheduler is waiting for alarm to go off
-  // block all other signals
+    /* mask while sleeping –
+   * allow the timer *and* keyboard signals so they wake sigsuspend()   */
   sigset_t suspend_set;
   sigfillset(&suspend_set);
   sigdelset(&suspend_set, SIGALRM);
+  sigdelset(&suspend_set, SIGALRM);
+sigdelset(&suspend_set, SIGINT);
+sigdelset(&suspend_set, SIGTSTP);
 
   // register an empty handler so that default disposition is overridden
   struct sigaction act = (struct sigaction){
@@ -272,6 +280,7 @@ static void kernel_scheduler() {
 
   assert_non_negative(pthread_mutex_lock(&shutdown_mtx), "Mutex lock error in kernel_scheduler");
   while (!shutdown) {
+
     assert_non_negative(pthread_mutex_unlock(&shutdown_mtx), "Mutex unlock error in kernel_scheduler");
 
     if (vec_len(&ready_prcs_queues[next_priority]) != 0) {
@@ -307,7 +316,10 @@ static void kernel_scheduler() {
       // 1 clock tick), though this can also be fixed by explicitly checking for running_prc during
       //  examine_blocked_processes()
       if (running_prc->state == PROCESS_STATE_READY) {
-        vec_push_back(&ready_prcs_queues[running_prc->priority], running_prc);
+        if (!vec_contains_ptr(&ready_prcs_queues[running_prc->priority], running_prc)) {
+          vec_push_back(&ready_prcs_queues[running_prc->priority], running_prc);
+        }
+        
         logger_log(logger, LOG_LEVEL_DEBUG, "PID [%d] used quantum and re-added to ready queue[%d] in scheduler",
           running_prc->pid, running_prc->priority);
       }
@@ -338,9 +350,17 @@ static void kernel_scheduler() {
       logger_log(logger, LOG_LEVEL_DEBUG, "ready queue[%d] empty so pass", next_priority);
       next_priority = scheduler_get_next_priority();
     }
+        /* re-acquire the mutex so the next while-condition is
+     * synchronised with k_shutdown()                                  */
+    assert_non_negative(pthread_mutex_lock(&shutdown_mtx),
+                        "kernel_scheduler lock (bottom-of-loop)");
 
   }
-  
+  fprintf(stderr, "DBG[sched]: shutdown flag observed – leaving loop\n");
+
+  /* drop the lock we still hold when we break out of the loop */
+  assert_non_negative(pthread_mutex_unlock(&shutdown_mtx),
+                    "kernel_scheduler final unlock");
   logger_log(logger, LOG_LEVEL_INFO, "kernel_scheduler concludes");
 }
 
@@ -381,17 +401,15 @@ static void process_control_initialize() {
   blocked_prcs = vec_new(0, NULL);
   pending_sig_prcs = vec_new(0, NULL);
 
-  for (schedule_priority i = PRIORITY_1; i < PRIORITY_COUNT - 1; ++i) {
+  for (schedule_priority i = PRIORITY_1; i < PRIORITY_COUNT; ++i) {
     ready_prcs_queues[i] = vec_new(0, NULL);
   }
 
-  // initialize logger (to stderr by default)
-  if (!logger) {
-    logger = logger_init_stderr(LOG_LEVEL_DEBUG, PROCESS_CONTROL_MODULE_NAME);
-  }
-  
-  initialized = true;
-  logger_log(logger, LOG_LEVEL_DEBUG, "process control initialized");
+  /* ───────── default logger ───────────────────────────────────────── */
+if (!logger) {
+  /* write to  logs/kernel.log  at INFO level                       */
+  logger = logger_init("kernel", LOG_LEVEL_INFO);
+}
 }
 
 /**
@@ -424,81 +442,128 @@ static void create_init(void* (*starting_shell_func)(void*), void* starting_shel
 /**
  * Routine function of INIT
  */
+static void* init_routine(void* arg)
+{
+    logger_log(logger, LOG_LEVEL_DEBUG, "INIT routine started");
 
-static void* init_routine(void* arg) {
-  logger_log(logger, LOG_LEVEL_DEBUG, "INIT routine started");
+    fprintf(stderr, "DBG[cleanup]: here6.1\n");
+    assert_non_null(arg, "Arg null for init_routine");
+    fprintf(stderr, "DBG[cleanup]: here6.2\n");
 
-  assert_non_null(arg, "Arg null for init_routine");
-  starting_shell_args_t* args_to_init = (starting_shell_args_t*) arg;
 
-  pcb_t* starting_shell_pcb = create_pcb(INIT_PID + 1, args_to_init->init_pcb);
-  assert_non_null(starting_shell_pcb, "Created shell PCB is null in init_routine");
+    starting_shell_args_t* args_to_init = (starting_shell_args_t*)arg;
 
-  // the shell should be run with top priority
-  starting_shell_pcb->priority = PRIORITY_1;
+    /* ───── create the shell process ─────────────────────────────── */
+    pcb_t* starting_shell_pcb =
+        create_pcb(get_new_pid(),           /* get a fresh PID       */
+                   args_to_init->init_pcb); /* parent = INIT         */
+
+                   fprintf(stderr, "DBG[cleanup]: here6.3\n");
+    assert_non_null(starting_shell_pcb,
+                    "Created shell PCB is null in init_routine");
+
+                    fprintf(stderr, "DBG[cleanup]: here6.4\n");
+
+    /* top priority for the interactive shell                        */
+    starting_shell_pcb->priority = PRIORITY_1;
+
+    const pid_t starting_shell_pid = starting_shell_pcb->pid;
+
+    set_pcb_at_pid(starting_shell_pid, starting_shell_pcb);
+    /* leave the exit-wrapper in place so PCB bookkeeping happens */
+
+    fprintf(stderr, "DBG[cleanup]: here6.5\n");
+    set_routine_and_run_helper(starting_shell_pcb,
+                                 args_to_init->shell_func,
+                                 args_to_init->shell_arg,
+                                 true  /* wrap_exit */);
+
+                                 fprintf(stderr, "DBG[cleanup]: here6.6\n");
+
+    free(arg);
+
+    fprintf(stderr, "DBG[cleanup]: here6.7\n");
+
+    /* give the shell terminal control */
+    term_ctrl_pid = starting_shell_pid;
+
+    if (strcmp(starting_shell_pcb->process_name, DEFAULT_PROCESS_NAME) == 0)
+        set_process_name(starting_shell_pcb, "SHELL");
+
+    /* ───── wait until the shell terminates ──────────────────────── */
+    while (true) {
+      errno = 0;
+      fprintf(stderr, "DBG[INIT]: before k_waitpid\n");
+      pid_t waited = k_waitpid(-1, NULL, true);   /* NOHANG = true        */
+      fprintf(stderr, "DBG[INIT]: after k_waitpid\n");
+      
+      if (waited == starting_shell_pid)
+          break;                                  /* shell reaped         */
+
   
-  const pid_t starting_shell_pid = starting_shell_pcb->pid;
-  set_pcb_at_pid(starting_shell_pid, starting_shell_pcb);
-  set_routine_and_run_helper(starting_shell_pcb, args_to_init->shell_func, args_to_init->shell_arg, true);
-  free(arg);
-
-  // give shell the terminal control
-  term_ctrl_pid = INIT_PID + 1;
-
-  if (strcmp(starting_shell_pcb->process_name, DEFAULT_PROCESS_NAME) == 0) {
-    set_process_name(starting_shell_pcb, "SHELL");
+      if (waited == -1 && errno == ECHILD)        /* POSIX style          */
+          break;
+  
+      /* nothing to do – yield for one tick so we don’t busy-loop         */
+      k_sleep(1);
   }
 
-  while (true) {
-    pid_t waited_pid = k_waitpid(-1, NULL, false);
-    if (waited_pid == starting_shell_pid) {
-      logger_log(logger, LOG_LEVEL_INFO, "INIT has waited shell, will trigger shutdown");
-      break;
-    }
-  }
+    logger_log(logger, LOG_LEVEL_DEBUG, "INIT triggering shutdown");
+    k_shutdown();
+    fprintf(stderr, "DBG[INIT]: k_shutdown() returned\n");   /* <-- here */
 
-  logger_log(logger, LOG_LEVEL_DEBUG, "INIT triggering shutdown");
-  k_shutdown();
-
-  logger_log(logger, LOG_LEVEL_DEBUG, "INIT routine completed");
-  return NULL;
+    /* mark our own PCB as ZOMBIED and leave the scheduler a corpse to reap */
+    k_exit();                                     /* never returns */
+    return NULL;                                  /* placate -Werror */
 }
+
+
 
 /**
  * Clean up the process control module metadata upon graceful shutdown
  */
 // static void process_control_cleanup() {
-static void process_control_cleanup() {
-  logger_log(logger, LOG_LEVEL_DEBUG, "process_control_cleanup started");
+  static void process_control_cleanup(void)
+  {
+      logger_log(logger, LOG_LEVEL_DEBUG, "cleanup started");
+  
+      fprintf(stderr, "DBG[cleanup]: before calling spthread_self\n");
 
-  for (size_t i = 0; i < vec_len(&all_prcs); ++i) {
-    pcb_t* pcb_ptr = vec_get(&all_prcs, i);
-    if (pcb_ptr) {
-      spthread_cancel_and_join(pcb_ptr->spthread);
-      logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d](%d) cancelled and joined", i + 1, pcb_ptr->pid);
-    }
+      spthread_t self;
+      bool am_sp = spthread_self(&self);
+
+      fprintf(stderr, "DBG[cleanup]: before for loop\n");  
+  
+      for (size_t i = 0; i < vec_len(&all_prcs); ++i) {
+          pcb_t *p = vec_get(&all_prcs, i);
+          if (!p) continue;
+          if (am_sp && spthread_equal(self, p->spthread)) continue;
+          spthread_cancel_and_join(p->spthread);
+      }
+  
+      fprintf(stderr, "DBG[cleanup]: after joins\n");           /* ➊ */
+  
+      vec_destroy(&blocked_prcs);
+      fprintf(stderr, "DBG[cleanup]: blocked_prcs destroyed\n");/* ➋ */
+  
+      vec_destroy(&pending_sig_prcs);
+      fprintf(stderr, "DBG[cleanup]: pending_sig_prcs destroyed\n");/* ➌ */
+  
+      for (schedule_priority i = PRIORITY_1; i < PRIORITY_COUNT; ++i) {
+          vec_destroy(&ready_prcs_queues[i]);
+          fprintf(stderr, "DBG[cleanup]: ready_q[%d] destroyed\n", i);/* ➍ */
+      }
+  
+      vec_destroy(&all_prcs);
+      fprintf(stderr, "DBG[cleanup]: all_prcs destroyed\n");    /* ➎ */
+  
+      pthread_mutex_destroy(&shutdown_mtx);
+      fprintf(stderr, "DBG[cleanup]: mutex destroyed\n");       /* ➏ */
+  
+      logger_close(logger);
+      fprintf(stderr, "DBG[cleanup]: logger closed – leaving cleanup\n");/* ➐ */
   }
-
-  vec_destroy(&blocked_prcs);
-  vec_destroy(&pending_sig_prcs);
-
-  for (schedule_priority i = PRIORITY_1; i < PRIORITY_COUNT - 1; ++i) {
-    vec_destroy(&ready_prcs_queues[i]);
-  }
-  logger_log(logger, LOG_LEVEL_DEBUG, "Blocked / Stopped / Signal / Ready vecs destructed");
-
-  vec_destroy(&all_prcs);
-  logger_log(logger, LOG_LEVEL_DEBUG, "all_prcs vec destructed");
-
-  assert_non_negative(pthread_mutex_destroy(&shutdown_mtx), 
-    "Error init mutex in process_control_initialize");
-
-  logger_log(logger, LOG_LEVEL_DEBUG, "process_control_cleanup completed");
-
-  logger_log(logger, LOG_LEVEL_DEBUG, "Closing logger");
-  logger_close(logger);  
-
-}
+  
 
 /**
  * Register the keyboard async signals (CTRL-C, CTRL-Z) to the process holding terminal control
@@ -508,29 +573,20 @@ static void register_async_signals() {
     return;
   }
 
-  // if it ever goes to INIT, ignore
-  if (term_ctrl_pid == INIT_PID) {
-    logger_log(logger, LOG_LEVEL_INFO, "Async signal ignored for INIT");
-    return;
+  /* never forward to init itself, but *always* forward to whoever      *
+ * currently owns the terminal – including the shell                  */
+if (term_ctrl_pid != INIT_PID) {
+  pcb_t *p = get_pcb_at_pid(term_ctrl_pid);
+  if (p) {
+      if (flag_sigint)
+          p->pending_signals = P_SIG_ADDSIG(p->pending_signals, P_SIGTERM);
+      if (flag_sigtstp)
+          p->pending_signals = P_SIG_ADDSIG(p->pending_signals, P_SIGSTOP);
+        
+        if (!vec_contains_ptr(&pending_sig_prcs, p))
+           vec_push_back(&pending_sig_prcs, p);
   }
-
-  // if not shell holding terminal control
-  if (term_ctrl_pid != INIT_PID + 1) {
-    pcb_t* proc = get_pcb_at_pid(term_ctrl_pid);
-    if (proc) {
-      if (flag_sigint) {
-        proc->pending_signals = P_SIG_ADDSIG(proc->pending_signals, P_SIGTERM);
-        logger_log(logger, LOG_LEVEL_DEBUG, "P_SIGTERM registered for PID[%d] (from keyboard)", term_ctrl_pid);
-      }
-  
-      if (flag_sigtstp) {
-        proc->pending_signals = P_SIG_ADDSIG(proc->pending_signals, P_SIGSTOP);
-        logger_log(logger, LOG_LEVEL_DEBUG, "P_SIGSTOP registered for PID[%d] (from keyboard)", term_ctrl_pid);
-      }
-
-      vec_push_back(&pending_sig_prcs, proc);
-    }
-  }
+}
 
   flag_sigint = false;
   flag_sigtstp = false;
@@ -559,6 +615,7 @@ static void handle_pending_signals() {
         continue;
       }
 
+      proc->waitpid_stat = P_SIGTERM;
       lifecycle_event_log(proc, "SIGNALED", NULL);
 
       // remove from ready queues and blocking list if necessary
@@ -611,11 +668,13 @@ static void handle_pending_signals() {
       }
       // blocked list do not need to be checked as a process stays in the blocked list if both blocked and stopped
 
+      proc->waitpid_stat = P_SIGSTOP;
       if (proc->parent) {
         vec_push_back(&proc->parent->waitable_children, proc);
       }
 
-      proc->state = PROCESS_STATE_STOPPED;    // blocked process will also be marked stopped
+      proc->state = PROCESS_STATE_STOPPED;
+      stopcont_event_log(proc, "STOPPED");   // blocked process will also be marked stopped
       proc->pending_signals = 0;
 
       // P_SIGCONT will be ignored
@@ -638,8 +697,12 @@ static void handle_pending_signals() {
             // put into ready queue only if it is not running_prc, to avoid double-queuing 
             // (running_prc will be added back to ready queue by scheduler after quantum finishes
             // if its state is READY)
-            vec_push_back(&ready_prcs_queues[proc->priority], proc);
-            logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] continued and ready for schedule (put into ready queue[%d])", proc->pid, proc->priority);
+
+            if (!vec_contains_ptr(&ready_prcs_queues[proc->priority], proc)) {
+              vec_push_back(&ready_prcs_queues[proc->priority], proc);
+            }
+
+            stopcont_event_log(proc, "CONTINUED");
           }
         }
 
@@ -655,6 +718,20 @@ static void handle_pending_signals() {
   vec_clear(&pending_sig_prcs);
 }
 
+static bool looks_like_cstring(const char *s)
+{
+    if (!s) return false;
+
+    /* accept up to 64 printable ASCII chars followed by NUL        */
+   for (size_t i = 0; i < 64; ++i) {
+       unsigned char c = (unsigned char)s[i];
+        if (c == '\0')              /* NUL terminator – good        */
+            return i > 0;           /* empty string is “bad”        */
+        if (c < 32 || c > 126)      /* not printable ASCII          */
+            return false;
+    }
+    return false;                   /* too long / no NUL            */
+}
 /**
  * Examine the current blocked processes and unblock those with block condition not longer holds
  * 
@@ -698,6 +775,7 @@ static void examine_blocked_processes() {
     }
 
     // no longer blocking
+    block_event_log(proc, "UNBLOCKED");
     vec_erase(&blocked_prcs, index);
 
     // schedule for running only if it is showing as BLOCKED previously
@@ -709,7 +787,10 @@ static void examine_blocked_processes() {
         // put into ready queue only if it is not running_prc, to avoid double-queuing 
         // (running_prc will be added back to ready queue by scheduler after quantum finishes
         // if its state is READY)
-        vec_push_back(&ready_prcs_queues[proc->priority], proc);
+        if (!vec_contains_ptr(&ready_prcs_queues[proc->priority], proc)) {
+          vec_push_back(&ready_prcs_queues[proc->priority], proc);
+        }
+        
         logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] unblocks and ready for schedule (put into ready queue[%d])", proc->pid, proc->priority);
       }
     } else {
@@ -966,22 +1047,32 @@ static int set_routine_and_run_helper(pcb_t* proc, void* (*func)(void*), void* a
   }
   logger_log(logger, LOG_LEVEL_DEBUG, "Spthread created with thd routine for PID[%d]", proc->pid);
 
-  // SET UP PROCESS NAME
-  char* process_name = NULL;
-  if (proc->pid ==INIT_PID) {
+  /* SET UP PROCESS NAME */
+char *process_name = NULL;
+if (proc->pid == INIT_PID) {
     process_name = INIT_PROCESS_NAME;
-  } else if (arg == NULL) {
+
+    } else if (wrap_exit && arg) {       /* might be argv **            */
+          char **maybe_argv = (char **)arg;
+          if (maybe_argv &&
+              looks_like_cstring(maybe_argv[0]))      /* safe-guard      */
+              process_name = maybe_argv[0];
+          else
+              process_name = DEFAULT_PROCESS_NAME;
+} else {
     process_name = DEFAULT_PROCESS_NAME;
-  } else {
-    char** argv = (char**) arg;
-    process_name = argv[0];
-  }
-  set_process_name(proc, process_name);
+}
+set_process_name(proc, process_name);
+
   logger_log(logger, LOG_LEVEL_DEBUG, "Process name set for PID[%d]: %s", proc->pid, proc->process_name);
 
   // ADD TO SCHEDULING READY QUEUE
   proc->state = PROCESS_STATE_READY;
-  vec_push_back(&ready_prcs_queues[proc->priority], proc);
+
+  if (!vec_contains_ptr(&ready_prcs_queues[proc->priority], proc)) {
+    vec_push_back(&ready_prcs_queues[proc->priority], proc);
+  }
+  
   logger_log(logger, LOG_LEVEL_DEBUG, "PID [%d] added to ready queue[%d] in set_routine_and_run_helper", proc->pid, proc->priority);
 
   lifecycle_event_log(proc, "CREATED", NULL);
@@ -1076,17 +1167,15 @@ static void init_adopt_children(pcb_t* pcb) {
  * themselves
  */
 static void register_blocked_state(pcb_t* pcb) {
-  vec_push_back(&blocked_prcs, pcb);
+      /* only insert once */
+      if (!vec_contains_ptr(&blocked_prcs, pcb))
+      vec_push_back(&blocked_prcs, pcb);
 
   if (pcb->state == PROCESS_STATE_READY) {
-    pcb->state = PROCESS_STATE_BLOCKED;
-
-    // this should not be needed as the running process is not in ready queue
-    if (remove_pcb_first_from_vec(pcb, &ready_prcs_queues[pcb->priority])) {
-      logger_log(logger, LOG_LEVEL_WARN, "PID[%d] removed from ready queue[%d] (existing unexpectedly) in register_blocked_state", pcb->pid, pcb->priority);
-    }
-    
+      pcb->state = PROCESS_STATE_BLOCKED;
+      block_event_log(pcb, "BLOCKED");
   }
+  /* if it was STOPPED or already BLOCKED we leave the state unchanged */
 
   // no need to change state if was STOPPED or BLOCKED
   // since a stopped process should still be stopped when blocked or unblocked
@@ -1094,14 +1183,24 @@ static void register_blocked_state(pcb_t* pcb) {
   // or READY when the stop condition is lifted (i.e. receives P_SIGCONT)
 }
 
-/**
- * Cancel and join a spthread
- */
-static void spthread_cancel_and_join(spthread_t thread) {
-  spthread_cancel(thread);
-  spthread_continue(thread);
-  spthread_suspend(thread); // forces the spthread to hit a cancellation point
-  spthread_join(thread, NULL);
+/* Cancel a spthread, let it reach a cancellation point, then join it */
+static void spthread_cancel_and_join(spthread_t t)
+{
+    /* pthread_t is opaque; cast to void * for %p */
+    fprintf(stderr,
+            "DBG[cleanup]: cancelling thread %p\n", (void *)t.thread);
+
+    spthread_cancel(t);          /* set the cancellation flag            */
+    spthread_continue(t);        /* make sure it is running              */
+    spthread_suspend(t);         /* … and block until it hits a checkpoint */
+
+    fprintf(stderr,
+            "DBG[cleanup]: join thread %p …\n", (void *)t.thread);
+
+    spthread_join(t, NULL);      /* reap resources                       */
+
+    fprintf(stderr,
+            "DBG[cleanup]: joined thread %p\n", (void *)t.thread);
 }
 
 /**
@@ -1180,10 +1279,16 @@ static void process_deathbed(pcb_t* proc) {
     vec_push_back(&(proc->parent->waitable_children), proc);
   }
 
-  if (term_ctrl_pid == proc->pid) {
-    term_ctrl_pid = INIT_PID + 1;
-  }
+      /* from here on a second invocation can safely bail out            */
+    if (proc->state == PROCESS_STATE_ZOMBIED ||
+          proc->state == PROCESS_STATE_TERMINATED)
+          return;
 
+    /* give the terminal back to INIT itself                     */
+  if (term_ctrl_pid == proc->pid)
+      term_ctrl_pid = INIT_PID;
+
+  proc->state = PROCESS_STATE_ZOMBIED;
   lifecycle_event_log(proc, "ZOMBIE", NULL);
 
   // have INIT adopt all children (and waitable children)
@@ -1197,28 +1302,71 @@ static void process_deathbed(pcb_t* proc) {
 /**
  * Helper function to print log the schedule events
  */
-static void schedule_event_log(pcb_t* proc, schedule_priority priority) {
-  if (!proc) {
-    logger_log(logger, LOG_LEVEL_WARN, "PCB null in schedule_event_log");
-    return;
-  }
-  logger_log(logger, LOG_LEVEL_DEBUG, "\t[%4d]\t%-7s\t%d\t%d\t%s",
-    clock_tick, "SCHEDULE", proc->pid, priority, (proc->process_name) ? proc->process_name : "?");
-}
+static void schedule_event_log(pcb_t *p, schedule_priority q)
+{
+    if (!p) return;
+
+    /* keep the line format identical – just lower the level            */
+    logger_log(logger, LOG_LEVEL_DEBUG,
+               "[%d]\tSCHEDULE\t%d\t%d\t%s",
+               clock_tick,
+              p->pid,
+               q,
+               (p->process_name) ? p->process_name : "<null>");
+ }
 
 /**
  * Helper function to print log the life cycle events
  */
-static void lifecycle_event_log(pcb_t* proc, char* event_name, char* add_msg){
-  if (!proc) {
-    logger_log(logger, LOG_LEVEL_WARN, "PCB null in lifecycle_event_log");
-    return;
-  }
-  // logger_log(logger, LOG_LEVEL_INFO, "\t[%4d]\t%-7s\t%d\t%d\t%s %s",
-  //   clock_tick, (event_name) ? event_name : "<EVENT>", proc->pid,
-  //   proc->priority, (proc->process_name) ? proc->process_name : "<null>",
-  //   (add_msg) ? add_msg : "");
+static void lifecycle_event_log(pcb_t *p,
+  const char *event,
+  const char *extra)
+/* event = CREATE | SIGNALED | EXITED | ZOMBIE | ORPHAN | WAITED    */
+{
+if (!p || !event) return;
+
+/* [ticks] EVENT PID NICE_VALUE PROCESS_NAME [extra] */
+logger_log(logger, LOG_LEVEL_INFO,
+"[%d]\t%s\t%d\t%d\t%s%s%s",
+clock_tick,
+event,
+p->pid,
+p->priority,
+(p->process_name) ? p->process_name : "<null>",
+(extra) ? "\t" : "",
+(extra) ? extra : "");
 }
+
+static void nice_event_log(pcb_t *p, int old_pri, int new_pri)
+/* [ticks] NICE PID OLD_NICE_VALUE NEW_NICE_VALUE PROCESS_NAME      */
+{
+    if (!p) return;
+
+    logger_log(logger, LOG_LEVEL_INFO,
+               "[%d]\tNICE\t%d\t%d\t%d\t%s",
+               clock_tick,
+               p->pid,
+               old_pri,
+               new_pri,
+               (p->process_name) ? p->process_name : "<null>");
+}
+
+static void block_event_log(pcb_t *p, const char *event)
+{
+    if (!p || !event) return;
+    logger_log(logger, LOG_LEVEL_DEBUG,
+               "[%d]\t%s\t%d\t%d\t%s",
+               clock_tick,
+               event,
+               p->pid,
+               p->priority,
+               (p->process_name) ? p->process_name : "<null>");
+}
+
+static void stopcont_event_log(pcb_t *p, const char *event)
+{
+    block_event_log(p, event);            /* same DEBUG level */
+ }
 
 /**
  * Helper function to find the first occurence of pcb_ptr in a Vec and remove it if found
@@ -1262,6 +1410,15 @@ static int remove_pcb_all_from_vec(pcb_t* pcb_ptr, Vec* vec) {
   return count;
 }
 
+/* === util for pointer-membership in a Vec ======================= */
+static bool vec_contains_ptr(Vec *v, void *ptr)
+{
+    for (size_t i = 0; i < vec_len(v); ++i)
+        if (vec_get(v, i) == ptr)
+            return true;
+    return false;
+}
+
 /********************
  * public functions *
  ********************/
@@ -1278,6 +1435,7 @@ void k_kernel_start(void* (*starting_shell)(void*), void* arg) {
   kernel_scheduler();
 
   process_control_cleanup();
+  fprintf(stderr, "DBG[kernel]: k_kernel_start() returns\n");
 }
 
 pcb_t* k_proc_create(pcb_t* parent) {
@@ -1310,20 +1468,25 @@ int k_set_routine_and_run(pcb_t* proc, void* (*func)(void*), void* arg) {
 }
 
 void k_proc_cleanup(pcb_t* proc) {
-  if (proc->state != PROCESS_STATE_TERMINATED) {
+  if (proc->state != PROCESS_STATE_ZOMBIED && proc->state != PROCESS_STATE_TERMINATED) {
     logger_log(logger, LOG_LEVEL_WARN, "k_proc_cleanup not done as process not terminated");
     return;
   }
 
-  // join spthread
+  fprintf(stderr, "DBG[cleanup]: calling k_proc_cleanup()\n"); 
+  /* join only once, ignore if already joined */
   spthread_cancel_and_join(proc->spthread);
+  proc->state = PROCESS_STATE_TERMINATED;
 
+  fprintf(stderr, "DBG[cleanup]: exited spthread_cancel_and_join\n");
   pcb_t* parent_pcb = proc->parent;
   if (parent_pcb) {
+    fprintf(stderr, "DBG[cleanup]: here1\n");
     // remove from parent's child vec
     // assume waitable children has been cleaned up when it becomes zombie
     if (!remove_pcb_first_from_vec(proc, &parent_pcb->children)) {
       logger_log(logger, LOG_LEVEL_WARN, "Cannot find reaped child in k_waitpid");
+      fprintf(stderr, "DBG[cleanup]: here2\n");
     }
   } else {
     logger_log(logger, LOG_LEVEL_WARN, "Parent PCB null in k_proc_cleanup");
@@ -1331,14 +1494,17 @@ void k_proc_cleanup(pcb_t* proc) {
 
   // double check whether all children has gone (been adopted previously)
   if (vec_len(&proc->children) > 0 || vec_len(&proc->waitable_children) > 0) {
+    fprintf(stderr, "DBG[cleanup]: here3\n");
     logger_log(logger, LOG_LEVEL_WARN, "Unadopted orphan found in k_waitpid");
     init_adopt_children(proc);
+    fprintf(stderr, "DBG[cleanup]: here4\n");
   }
   
   // remove the pcb from all_prcs, which will automatically destruct the PCB
   pid_t my_pid = proc->pid;
   logger_log(logger, LOG_LEVEL_DEBUG, "Setting all_prcs for PID %d to NULL", my_pid);
   set_pcb_at_pid(my_pid, NULL);
+  fprintf(stderr, "DBG[cleanup]: here5\n");
 
 }
 
@@ -1404,8 +1570,9 @@ pid_t k_waitpid(pid_t pid, int* wstatus, bool nohang) {
       lifecycle_event_log(waited_child, "WAITED", (self_pcb->pid == INIT_PID) ? "(by init)" : NULL);
 
       // if waited child has terminated (zombie), reap it
-      if (waited_child->state == PROCESS_STATE_TERMINATED) {
+      if (waited_child->state == PROCESS_STATE_ZOMBIED) {
         k_proc_cleanup(waited_child);
+        fprintf(stderr, "DBG[cleanup]: here6\n");
       }
 
       return waited_child_pid;
@@ -1413,7 +1580,13 @@ pid_t k_waitpid(pid_t pid, int* wstatus, bool nohang) {
     } else {
       // have not found a child to wait, register block info and block, or return 0 for nohang
       if (nohang) {
-        return 0;
+        /* if the caller has *no* children at all, report ECHILD     */
+    if (vec_len(&self_pcb->children) == 0) {
+      errno = ECHILD;
+      return -1;
+  }
+  /* otherwise: children exist but none is waitable right now  */
+  return 0;
       }
 
       logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] cannot find waited child, will start blocking", self_pcb->pid);
@@ -1451,8 +1624,14 @@ int k_nice(pid_t pid, int priority) {
     }
   }
 
+    int old_pri = proc->priority;
   proc->priority = priority;
-  vec_push_back(&ready_prcs_queues[proc->priority], proc);
+  nice_event_log(proc, old_pri, priority);
+  
+  if (!vec_contains_ptr(&ready_prcs_queues[proc->priority], proc)) {
+    vec_push_back(&ready_prcs_queues[proc->priority], proc);
+  }
+  
   logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] added to ready queue[%d] in k_nice", proc->pid, proc->priority);
 
   return 0;
@@ -1486,6 +1665,7 @@ int k_kill(pid_t pid, int signal) {
   proc->pending_signals = P_SIG_ADDSIG(proc->pending_signals, signal);
 
   // record the process which has pending signal
+  if (!vec_contains_ptr(&pending_sig_prcs, proc)) 
   vec_push_back(&pending_sig_prcs, proc);
 
   return 0;
@@ -1513,11 +1693,11 @@ void k_exit(void) {
   assert_non_null(self_pcb, "PCB not found in k_exit");
   logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] running k_exit", self_pcb->pid);
 
+    /* record normal exit status and mark zombie */
+  self_pcb->waitpid_stat = 0;                    /* WIFEXITED */
   lifecycle_event_log(self_pcb, "EXITED", NULL);
 
-  process_deathbed(self_pcb);
-
-  self_pcb->state = PROCESS_STATE_TERMINATED;
+  process_deathbed(self_pcb);                   /* sets ZOMBIED */
   
   spthread_exit(NULL);
 }
@@ -1526,6 +1706,7 @@ void k_shutdown(void) {
   assert_non_negative(spthread_disable_interrupts_self(), "Error disable_interrupt in k_shutdown");
   assert_non_negative(pthread_mutex_lock(&shutdown_mtx), "Mutex lock error in k_shutdown");
   shutdown = true;
+
   assert_non_negative(pthread_mutex_unlock(&shutdown_mtx), "Mutex unlock error in k_shutdown");
   assert_non_negative(spthread_enable_interrupts_self(), "Error enable_interrupts in k_shutdown");
 }

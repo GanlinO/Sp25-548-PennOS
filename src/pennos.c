@@ -5,6 +5,7 @@
 #include "common/pennfat_errors.h"
 #include "user/shell.h"
 #include "util/logger.h"
+#include "syscall/syscall_kernel.h"   /* ⟵ s_spawn / s_waitpid / s_sleep   */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,10 +69,11 @@ int main(int argc, char *argv[])
     Logger *logger = logger_init_stderr(LOG_LEVEL_INFO, "KERNEL");
     k_set_logger(logger);
 
-    fprintf(stderr, "Starting kernel …\n");
-    char *args[] = { "shell", NULL };
-    k_kernel_start(shell_main, args);           /* blocks until shutdown  */
+        fprintf(stderr, "Starting kernel …\n");
+        /* start kernel – its own INIT (PID 1) will run shell_main() */
+        k_kernel_start(shell_main, NULL);            /* blocks until shutdown  */
 
+    fprintf(stderr, "DBG[kernel]: k_kernel_start() returns\n");
     /**********************************************************************
      * 4.  unmount & cleanup                                              *
      *********************************************************************/

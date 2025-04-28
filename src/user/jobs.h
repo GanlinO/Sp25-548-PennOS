@@ -26,5 +26,6 @@ job_t *jobs_by_jid(int jid);           /* NULL if not found                */
 job_t *jobs_current_fg(void);          /* foreground job or NULL           */
 void   jobs_list(void);                /* built-in `jobs` output           */
 bool   jobs_have_stopped(void);        /* for `logout` guard               */
+void jobs_shutdown(void);
 
 #endif /* JOBS_H */
