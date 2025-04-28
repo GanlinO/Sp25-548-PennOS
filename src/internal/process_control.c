@@ -1368,7 +1368,7 @@ static void lifecycle_event_log(pcb_t *p,
 if (!p || !event) return;
 
 /* [ticks] EVENT PID NICE_VALUE PROCESS_NAME [extra] */
-logger_log(logger, LOG_LEVEL_INFO,
+logger_log(logger, LOG_LEVEL_DEBUG, // instead of LOG_LEVEL_INFO
 "[%d]\t%s\t%d\t%d\t%s%s%s",
 clock_tick,
 event,
