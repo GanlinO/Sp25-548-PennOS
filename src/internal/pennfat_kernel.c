@@ -2638,3 +2638,17 @@ PennFatErr k_rename(const char *oldpath, const char *newpath) {
  * tree from either the root (for absolute paths) or current working directory
  * (for relative paths).
  */
+
+ PennFatErr k_getattr(const char *path, PennFatAttr *out)
+ {
+     if (!g_mounted)                      return PennFatErr_NOT_MOUNTED;
+     if (!path || path[0] == '\0')        return PennFatErr_INVAD;
+ 
+     resolved_path_t r;
+     PennFatErr err = resolve_path(path, &r);
+     if (err != PennFatErr_OK)            return err;
+     if (!r.found)                        return PennFatErr_EXISTS;
+ 
+     out->perm = r.entry.perm;
+     return PennFatErr_OK;
+ }

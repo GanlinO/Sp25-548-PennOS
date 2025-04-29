@@ -4,6 +4,20 @@
 #include "../common/pennos_types.h"
 #include "../internal/pennfat_kernel.h"
 
+/* user-visible open() mode flags (must match kernel layer) */
+#define F_READ    0x01
+#define F_WRITE   0x02
+#define F_APPEND  0x04
+
+/* user-visible lseek() whence */
+#define F_SEEK_SET 0
+#define F_SEEK_CUR 1
+#define F_SEEK_END 2
+
+/* ------------------------------------------------------------------ */
+/* attribute query                                                    */
+int s_getattr(const char *path, PennFatAttr *attr);
+
 /* PennFAT wrappers --------------------------------------------------- */
 int         s_open (const char *path, int mode);
 int         s_close(int fd);

@@ -1,30 +1,78 @@
-#ifndef PROCESS_CONTROL_H
-#define PROCESS_CONTROL_H
-
-#include "../common/pennos_types.h"  // for pid_t clock_tick_t def
-#include "../common/pennos_signals.h"
-#include "../util/logger.h"   // for logging requirement
-
-/* ------------------------------------------------------------------ *
- * Forward declarations                                               *
- * ------------------------------------------------------------------ */
-
-typedef struct pcb_t pcb_t;              /* the (opaque) PCB structure   */
-
-/* per-process user-FD table entry                                    */
-typedef struct proc_fd_entry {
-        int kfd;                         /* kernel-level FD (from k_open)*/
-} proc_fd_entry_t;
-
-
-int  pcb_fd_alloc (pcb_t *p, proc_fd_entry_t *ent);
-
-/* look up a user-FD → *out; 0 on success, –1 + errno (EBADF) on failure    */
-int  pcb_fd_get   (pcb_t *p, int ufd, proc_fd_entry_t **out);
-
-/* close & forget a user-FD (silently ignore bad)                           */
-void pcb_fd_close (pcb_t *p, int ufd);
-
+/*─────────────────────────────────────────────────────────────
+  process_control.h  –  public kernel / scheduler interface
+  (kept in sync with process_control.c, Vec-based FD table)
+  ─────────────────────────────────────────────────────────────*/
+  #ifndef PROCESS_CONTROL_H
+  #define PROCESS_CONTROL_H
+  
+  /* ── common dependencies ─────────────────────────────────────*/
+  #include <stdbool.h>
+  #include <stddef.h>
+  #include <stdint.h>
+  #include <sys/types.h>               /* off_t                         */
+  
+  #include "../common/pennos_types.h"  /* pid_t, clock_tick_t           */
+  #include "../common/pennos_signals.h"
+  #include "../util/spthread.h"
+  #include "../util/Vec.h"
+  #include "../util/logger.h"
+  
+  /* ── file-descriptor flags (spec-compliant) ──────────────────*/
+  #define F_READ    0x01
+  #define F_WRITE   0x02
+  #define F_APPEND  0x04
+  
+/* -------- per-process FD entry kept inside each PCB ----------- */
+typedef struct proc_fd_t {
+        int   kfd;        /* kernel-level FD                       */
+        int   flags;      /* F_READ | F_WRITE | F_APPEND           */
+        off_t offset;     /* private file pointer                  */
+        bool  in_use;     /* slot occupied                         */
+} proc_fd_t;
+  
+  /* =====================================================================
+     Process Control Block – **must** match process_control.c
+     =====================================================================*/
+     typedef struct pcb_st {
+        /* ── scheduler / identity ─────────────────────────── */
+        pid_t      pid;
+        int        priority;          /* 0 (hi) … 2 (lo)            */
+        int        state;             /* enum inside .c             */
+    
+        /* underlying user thread */
+        spthread_t spthread;          /* VALUE, not pointer         */
+    
+        /* ── parent/child hierarchy ────────────────────────── */
+        struct pcb_st *parent;
+        Vec       children;           /* Vec<pcb_t *>               */
+        Vec       waitable_children;  /* children waited via waitpid*/
+    
+        /* ── sleep bookkeeping ─────────────────────────────── */
+        bool           blocked_by_sleep;
+        clock_tick_t   wake_tick;
+    
+        /* ── signal / waitpid bookkeeping ──────────────────── */
+        signalset_t pending_signals;
+        int         waitpid_stat;
+    
+        /* ── NEW ▸ track which child we are blocked on ▸────── */
+        pid_t       waiting_child_pid;    /* 0 = none           */
+    
+        /* ── process name (pointer, allocated in .c) ───────── */
+        char       *process_name;
+    
+        /* ── per-process FD table ───────────────────────────── */
+        Vec  fds;                         /* Vec<proc_fd_entry*>*/
+    } pcb_t;
+  
+  /* ---------------------------------------------------------------------
+     FD-table helpers (implemented in process_control.c)
+     ---------------------------------------------------------------------*/
+     int  pcb_fd_alloc (pcb_t *p, proc_fd_t *entry);
+     /* 0 ≤ ufd < PROC_MAX_FD  → *out;  EBADF on bad */
+     int  pcb_fd_get   (pcb_t *p, int ufd, proc_fd_t **out);
+     /* close + invalidate slot                        */
+     void pcb_fd_close (pcb_t *p, int ufd);
 /**
  * @brief The entry point of the process control module. The OS should call this to start
  * the kernel, set up the starting shell to be born by INIT, and start the scheduler, and have

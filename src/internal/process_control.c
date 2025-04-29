@@ -249,7 +249,7 @@ static void async_sig_handler(int signum) {
 /********************
  * internal functions *
  ********************/
-int pcb_fd_alloc(pcb_t *p, proc_fd_entry_t *ent)
+int pcb_fd_alloc(pcb_t *p, proc_fd_t *ent)
 {
     if (!p || !ent) { errno = EBADF; return -1; }
 
@@ -261,7 +261,7 @@ int pcb_fd_alloc(pcb_t *p, proc_fd_entry_t *ent)
     return ufd;                               /* new user-FD */
 }
 
-int pcb_fd_get(pcb_t *p, int ufd, proc_fd_entry_t **out)
+int pcb_fd_get(pcb_t *p, int ufd, proc_fd_t **out)
 {
     if (!p || ufd < 0 || (size_t)ufd >= vec_len(&p->fds)) {
         errno = EBADF;  return -1;
@@ -273,7 +273,7 @@ int pcb_fd_get(pcb_t *p, int ufd, proc_fd_entry_t **out)
 
 void pcb_fd_close(pcb_t *p, int ufd)
 {
-    proc_fd_entry_t *tmp;
+    proc_fd_t *tmp;
     if (pcb_fd_get(p, ufd, &tmp) == -1) return;   /* nothing to do */
 
     // free(tmp);                                    /* release entry  */
@@ -992,7 +992,7 @@ static pcb_t* create_pcb(pid_t pid, pcb_t* parent) {
     .blocked_by_sleep = false,
     .wake_tick = 0,
     .waitpid_stat = 0,
-    .fds = vec_new(0, free),
+    .fds = vec_new(0, NULL),
     .pending_signals = 0,
     .process_name = NULL
   };
@@ -1004,21 +1004,20 @@ static pcb_t* create_pcb(pid_t pid, pcb_t* parent) {
     /* ── duplicate the parent’s open FDs so child has *independent*
      *    kernel descriptors and its *own* offsets                 */
     for (size_t i = 0; i < vec_len(&parent->fds); ++i) {
-        proc_fd_entry_t *p_ent = vec_get(&parent->fds, i);
+        proc_fd_t *p_ent = vec_get(&parent->fds, i);
         if (!p_ent) {                   /* hole → leave hole         */
             vec_push_back(&pcb_ptr->fds, NULL);
             continue;
         }
-        /* dup the kernel-fd so offsets are separate                */
-        int new_kfd = k_lseek(p_ent->kfd, 0, F_SEEK_CUR);
-        /* using k_open again would need the path – dup is easier   */
-        /* simple dup: allocate another entry in g_fd_table         */
-        new_kfd = k_open(NULL /* dup */, 0); /* ⇐ add tiny k_dup later */
-        /* FALL-BACK until k_dup() exists: reopen with same mode    */
-        if (new_kfd < 0) continue;      /* out of descriptors – ignore */
-
-        proc_fd_entry_t *child_ent = malloc(sizeof *child_ent);
-        child_ent->kfd = new_kfd;
+               /* simplified: share the same kernel FD for now.
+               +        * (When you add k_dup() you can replace this.)              */
+       proc_fd_t *child_ent = malloc(sizeof *child_ent);
+       *child_ent = (proc_fd_t){
+           .kfd    = p_ent->kfd,
+           .flags  = p_ent->flags,
+           .offset = p_ent->offset,
+           .in_use = true,
+       };
         vec_push_back(&pcb_ptr->fds, child_ent);
     }
   }

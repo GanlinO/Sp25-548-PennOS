@@ -171,9 +171,21 @@ void* touch(void* arg)
 /* ---------- ls (no arguments, PennFAT root only) ---------- */
 void* ls(void* arg)
 {
-  (void)arg;          /* unused */
-  PennFatErr err = s_ls(NULL);
-  if (err) fprintf(stderr, "ls: %s\n", PennFatErr_toErrString(err));
+    char **argv = (char**)arg;
+  
+    /* no operand → list cwd (NULL means “.” to PennFAT wrapper) */
+    if (!argv || !argv[1]) {
+        PennFatErr e = s_ls(NULL);
+        if (e) fprintf(stderr, "ls: %s\n", PennFatErr_toErrString(e));
+        return NULL;
+  }
+  
+    /* one or more explicit paths */
+    for (int i = 1; argv[i]; ++i) {
+        PennFatErr e = s_ls(argv[i]);
+        if (e) fprintf(stderr, "ls: %s: %s\n",
+                       argv[i], PennFatErr_toErrString(e));
+    }
   return NULL;
 }
 
@@ -202,9 +214,20 @@ static int parse_perm_abs(const char *s, uint8_t *mask)
         return 0;
     }
 
-    /* reject + / – prefixes (would need stat(2)-like support) ------- */
-    if (*s == '+' || *s == '-') return -1;
-
+        /* symbolic “+rwx” / “-wx” form --------------------------------- */
+    if (*s == '+' || *s == '-') {
+          bool add = (*s == '+');
+          ++s;
+          uint8_t m = 0;
+          for (; *s; ++s) {
+              if      (*s == 'r') m |= PERM_READ;
+              else if (*s == 'w') m |= PERM_WRITE;
+              else if (*s == 'x') m |= PERM_EXEC;
+              else                return -1;
+          }
+          *mask = add ? m : (uint8_t)(0x80 | m);   /* high bit ⇒ remove */
+          return 1;                                /* special code */
+      }
     /* symbolic “rwx” form ------------------------------------------ */
     uint8_t m = 0;
     for (; *s; ++s) {
@@ -220,28 +243,63 @@ static int parse_perm_abs(const char *s, uint8_t *mask)
 
 void* chmod(void *arg)
 {
-    char **argv = (char**)arg;
+    char **argv = (char **)arg;
     if (!argv || !argv[1] || !argv[2]) {
         fprintf(stderr, "chmod: usage: chmod MODE FILE …\n");
         return NULL;
     }
 
-    uint8_t perm;
-    if (parse_perm_abs(argv[1], &perm) < 0) {
-        fprintf(stderr,
-                "chmod: invalid (or +/-) mode '%s' "
-                "[only octal 0-7 or rwx supported]\n", argv[1]);
-        return NULL;
-    }
+    const char *mode   = argv[1];
+    bool relative_form = (mode[0] == '+' || mode[0] == '-');
 
     for (int i = 2; argv[i]; ++i) {
-        PennFatErr err = s_chmod(argv[i], perm);
-        if (err)
-            fprintf(stderr, "chmod: %s: %s\n",
-                    argv[i], PennFatErr_toErrString(err));
+        uint8_t new_perm;
+
+        /* ------------------------------------------------ relative */
+        if (relative_form) {
+            PennFatAttr a;
+            if (s_getattr(argv[i], &a) == -1) {   /* prints errno msg */
+                perror("chmod");
+                continue;
+            }
+            uint8_t cur = a.perm & 0x7;           /* keep rwx only    */
+            bool add    = (mode[0] == '+');
+
+            for (const char *p = mode + 1; *p; ++p) {
+                uint8_t bit =
+                      (*p == 'r') ? PERM_READ  :
+                      (*p == 'w') ? PERM_WRITE :
+                      (*p == 'x') ? PERM_EXEC  : 0;
+                if (!bit) {                       /* bad flag        */
+                    fprintf(stderr,
+                            "chmod: invalid mode flag '%c'\n", *p);
+                    goto nextfile;
+                }
+                cur = add ? (cur | bit) : (cur & ~bit);
+            }
+            new_perm = cur;
+        }
+        /* ------------------------------------------------ absolute */
+        else {
+            if (parse_perm_abs(mode, &new_perm) < 0) {
+                fprintf(stderr, "chmod: invalid mode '%s'\n", mode);
+                goto nextfile;
+            }
+        }
+
+        /* finally apply ------------------------------------------- */
+        {
+            PennFatErr err = s_chmod(argv[i], new_perm);
+            if (err != PennFatErr_OK)
+                fprintf(stderr, "chmod: %s: %s\n",
+                        argv[i], PennFatErr_toErrString(err));
+        }
+
+    nextfile: ;       /* label target – nothing else to do */
     }
     return NULL;
 }
+
 /* ---------- cat -------------------------------------------------- */
 #define CAT_BUFSZ 4096
 void *cat(void *arg)
@@ -279,17 +337,19 @@ void *cat(void *arg)
 
 
 /*----------- echo -----------------------------------------------------------*/
-void* echo(void* arg)
+void* echo(void *arg)
 {
-  char** argv = (char**)arg;          /* argv[0] == "echo"              */
-  if (!argv) return NULL;
+    char **argv = (char **)arg;
+    if (!argv) return NULL;
 
-  for (int i = 1; argv[i]; ++i) {
-    fputs(argv[i], stdout);
-    if (argv[i + 1]) fputc(' ', stdout);
-  }
-  fputc('\n', stdout);
-  return NULL;
+    for (int i = 1; argv[i]; ++i) {
+        const char *w = argv[i];
+        s_write(STDOUT_FILENO, w, (int)strlen(w));
+        if (argv[i + 1])
+            s_write(STDOUT_FILENO, " ", 1);
+    }
+    s_write(STDOUT_FILENO, "\n", 1);
+    return NULL;
 }
 
 /*----------- u_sleep   (shell command:  sleep N seconds) --------------------*/

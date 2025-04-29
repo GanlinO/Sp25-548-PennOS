@@ -7,7 +7,7 @@
 
 #include "../common/pennfat_errors.h"
 
-/* Initialization function: call this from your main application */
+/* Initialization function: call this from main application */
 void pennfat_kernel_init(void);
 
 /* Cleanup function: call this during application shutdown */
@@ -27,6 +27,10 @@ PennFatErr k_chmod(const char *path, uint8_t perm);
 PennFatErr k_mkdir(const char *path);
 PennFatErr k_rmdir(const char *path);
 PennFatErr k_symlink(const char *target, const char *linkpath);
+typedef struct {
+    uint8_t perm; 
+} PennFatAttr;
+PennFatErr k_getattr(const char *path, PennFatAttr *out);
 
 /* Kernel-Level API - Process Context (will depend on PCB integration) */
 PennFatErr k_chdir(const char *path);
