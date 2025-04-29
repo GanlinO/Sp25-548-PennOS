@@ -309,7 +309,7 @@ sigdelset(&suspend_set, SIGTSTP);
         continue;
       }
 
-      logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] popped from ready queue[%d], picked to run by scheduler",
+      logger_log(logger, LOG_LEVEL_INFO, "PID[%d] popped from ready queue[%d], picked to run by scheduler",
         running_prc->pid, next_priority);
       schedule_event_log(running_prc, next_priority);
 
@@ -318,7 +318,7 @@ sigdelset(&suspend_set, SIGTSTP);
       ++clock_tick;
       spthread_suspend(running_prc->spthread);
 
-      logger_log(logger, LOG_LEVEL_DEBUG, "Time quantum end for PID [%d]",
+      logger_log(logger, LOG_LEVEL_INFO, "Time quantum end for PID [%d]",
         running_prc->pid);
 
       // register async keyboard signals
@@ -336,7 +336,7 @@ sigdelset(&suspend_set, SIGTSTP);
           vec_push_back(&ready_prcs_queues[running_prc->priority], running_prc);
         }
         
-        logger_log(logger, LOG_LEVEL_DEBUG, "PID [%d] used quantum and re-added to ready queue[%d] in scheduler",
+        logger_log(logger, LOG_LEVEL_INFO, "PID [%d] used quantum and re-added to ready queue[%d] in scheduler",
           running_prc->pid, running_prc->priority);
       }
       running_prc = NULL;
@@ -823,10 +823,10 @@ static void examine_blocked_processes() {
           vec_push_back(&ready_prcs_queues[proc->priority], proc);
         }
         
-        logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] unblocks and ready for schedule (put into ready queue[%d])", proc->pid, proc->priority);
+        logger_log(logger, LOG_LEVEL_INFO, "PID[%d] unblocks and ready for schedule (put into ready queue[%d])", proc->pid, proc->priority);
       }
     } else {
-      logger_log(logger, LOG_LEVEL_DEBUG, "PID[%d] unblocks but not ready for schedule (still stopped)", proc->pid);
+      logger_log(logger, LOG_LEVEL_INFO, "PID[%d] unblocks but not ready for schedule (still stopped)", proc->pid);
     }
 
   }

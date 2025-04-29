@@ -669,14 +669,14 @@ void* u_nice(void* arg) {
     child_pid = s_spawn(func, argv + 2, 0, 1);
     if (child_pid < 0) {
       // spawn failed somehow
-      fprintf(stderr, "%s Failed to spawn process for command: %s\n", argv[0], argv[2]);
+      // fprintf(stderr, "%s Failed to spawn process for command: %s\n", argv[0], argv[2]);
     
     } else if (s_nice(child_pid, priority) == 0) {      // SYSTEM CALL TO UPDATE NICE VALUE
       // update nice value successful
-      fprintf(stderr, "Command run as PID[%d] and set to priority %d: %s\n", child_pid, priority, argv[2]);
+      // fprintf(stderr, "Command run as PID[%d] and set to priority %d: %s\n", child_pid, priority, argv[2]);
     } else {
       // TODO: more verbose response with errno checking
-      fprintf(stderr, "Command run as PID[%d] but set priority failed: %s\n", child_pid, argv[2]);
+      // fprintf(stderr, "Command run as PID[%d] but set priority failed: %s\n", child_pid, argv[2]);
     }
 
   } else {

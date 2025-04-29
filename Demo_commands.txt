@@ -1,0 +1,12 @@
+Scheduling
+Demo 1 - 4: top -p $(pgrep -f pennos)
+
+Demo 5:
+grep -P '\tSCHEDULE\t' logs/kernel.log > /tmp/sched.txt
+awk -F'\t' '
+    { q[$4]++; total++ }                 # $4 == priority column
+    END {
+        for (p in q)
+            printf "priority %s  %6d  %6.2f%%\n",
+                   p, q[p], 100*q[p]/total
+    }'  /tmp/sched.txt | sort -n
