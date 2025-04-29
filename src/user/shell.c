@@ -10,6 +10,7 @@
 
 #include "../internal/pennfat_kernel.h"
 #include "../common/pennfat_definitions.h"
+#include "../internal/process_control.h"
 
 #include <stdlib.h>   // NULL, atoi
 #include <errno.h>
@@ -114,11 +115,7 @@ static void debug_print_argv(char** argv);
 static void debug_print_parsed_command(struct parsed_command*);
 #endif
 
-static int open_for_read (const char *path)               { return s_open(path, K_O_RDONLY); }
-static int open_for_write(const char *path, bool append)  {
-  int flags = K_O_CREATE | (append ? K_O_APPEND : K_O_WRONLY);
-  return s_open(path, flags);
-}
+
 
 static pid_t spawn_stage(char **argv, int fd_in, int fd_out);
 static int  open_redirect(int *fd, const char *path, int flags);
@@ -126,6 +123,34 @@ static int  open_redirect(int *fd, const char *path, int flags);
 /*──────────────────────────────────────────────────────────────*/
 /*                NEW  BUILT-IN  IMPLEMENTATIONS                */
 /*──────────────────────────────────────────────────────────────*/
+
+/*──────────────────────────────────────────────────────────────*/
+/*    helper – guarantee we never close 0 / 1 / 2 by mistake    */
+/*──────────────────────────────────────────────────────────────*/
+/* If open() returns fd 0,1,2 we immediately dup the file by
+ * opening it a 2nd time, then carry on with the duplicate ≥3
+ * and leave the first handle untouched.  (Leaking one extra
+ * descriptor in the child process is harmless – the kernel
+ * reclaims it when the process exits.)                         */
+static int ensure_nonstd_fd(const char *path, int mode, int fd)
+{
+    if (fd >= 3)          /* already safe */
+        return fd;
+
+    int d = s_open(path, mode);   /* 2nd open → guaranteed ≥3 */
+    if (d < 0)
+        return fd;        /* fall back – we'll just avoid close() */
+    return d;
+}
+
+static bool pennfat_is_noent(PennFatErr e)
+{                       /* “file does not exist” in this API   */
+    return e == PennFatErr_EXISTS;
+}
+
+static bool pennfat_is_perm(PennFatErr e)
+{   return e == PennFatErr_PERM; }
+
 
 /* ---------- touch ---------- */
 void* touch(void* arg)
@@ -152,88 +177,106 @@ void* ls(void* arg)
   return NULL;
 }
 
-/* ---------- chmod ---------- */
-/**
- * Translate a symbolic permission string to a bit-mask.
- * Accepts:  "rwx", "+rw", "-x", etc.  The leading ‘+’/‘-’ is ignored – we
- * presently treat the request as an *absolute* mask because the underlying
- * s_chmod() overwrites the whole permission set.
- * Returns 0xFF on syntax error.
- */
-static uint8_t parse_perm_string(const char *s)
+/* ---------- chmod (updated) ---------- */
+static int parse_perm_abs(const char *s, uint8_t *mask)
+/* Accept **absolute** permission strings:
+ *   • one octal digit 0-7   (0 = ---, 7 = rwx)
+ *   • any combination of rwx (e.g. "rw", "x", "rwx")
+ * Returns 0 on success, –1 on error.                                  */
 {
-    if (!s) return 0xFF;
-    if (*s == '+' || *s == '-')            /* optional sign */ ++s;
+    if (!s || !*s) return -1;
 
+    /* octal digit? -------------------------------------------------- */
+    if (s[1] == '\0' && *s >= '0' && *s <= '7') {
+        static const uint8_t lut[8] = {
+            0,                     /* 0 --- */
+            PERM_EXEC,             /* 1 --x */
+            PERM_WRITE,            /* 2 -w- */
+            PERM_WRITE|PERM_EXEC,  /* 3 -wx */
+            PERM_READ,             /* 4 r-- */
+            PERM_READ |PERM_EXEC,  /* 5 r-x */
+            PERM_READ |PERM_WRITE, /* 6 rw- */
+            PERM_READ |PERM_WRITE|PERM_EXEC  /* 7 rwx */
+        };
+        *mask = lut[*s - '0'];
+        return 0;
+    }
+
+    /* reject + / – prefixes (would need stat(2)-like support) ------- */
+    if (*s == '+' || *s == '-') return -1;
+
+    /* symbolic “rwx” form ------------------------------------------ */
     uint8_t m = 0;
     for (; *s; ++s) {
         if      (*s == 'r') m |= PERM_READ;
         else if (*s == 'w') m |= PERM_WRITE;
         else if (*s == 'x') m |= PERM_EXEC;
-        else                return 0xFF;   /* illegal character */
+        else                return -1;          /* invalid char */
     }
-    return (m == 0) ? 0xFF : m;
+    if (m == 0) return -1;                      /* empty mask */
+    *mask = m;
+    return 0;
 }
 
-void* chmod(void* arg)
+void* chmod(void *arg)
 {
-  char** argv = (char**)arg;
-  if (!argv || !argv[1] || !argv[2]) {
-      fprintf(stderr, "chmod: usage: chmod PERMS FILE …\n");
-      return NULL;
-  }
+    char **argv = (char**)arg;
+    if (!argv || !argv[1] || !argv[2]) {
+        fprintf(stderr, "chmod: usage: chmod MODE FILE …\n");
+        return NULL;
+    }
 
-  /* parse the +rwx / -wx … string **once** */
-  uint8_t perm = parse_perm_string(argv[1]);
-  if (perm == 0xFF) {
-      fprintf(stderr, "chmod: invalid permission string '%s'\n", argv[1]);
-      return NULL;
-  }
+    uint8_t perm;
+    if (parse_perm_abs(argv[1], &perm) < 0) {
+        fprintf(stderr,
+                "chmod: invalid (or +/-) mode '%s' "
+                "[only octal 0-7 or rwx supported]\n", argv[1]);
+        return NULL;
+    }
 
-  /* try to apply it to every remaining operand */
-  for (int i = 2; argv[i]; ++i) {
-      PennFatErr err = s_chmod(argv[i], perm);
-      if (err)
-          fprintf(stderr, "chmod: %s: %s\n",
-                  argv[i], PennFatErr_toErrString(err));
-  }
-  return NULL;
+    for (int i = 2; argv[i]; ++i) {
+        PennFatErr err = s_chmod(argv[i], perm);
+        if (err)
+            fprintf(stderr, "chmod: %s: %s\n",
+                    argv[i], PennFatErr_toErrString(err));
+    }
+    return NULL;
 }
-
-/* ---------- cat (read files from PennFAT, print to stdout) ---------- */
+/* ---------- cat -------------------------------------------------- */
 #define CAT_BUFSZ 4096
-void* cat(void* arg)
+void *cat(void *arg)
 {
-    char** argv = (char**)arg;
-  /* No file names → echo STDIN until EOF --------------------------- */
-  if (!argv || !argv[1]) {
-      char buf[CAT_BUFSZ];
-      while (1) {
-          PennFatErr n = s_read(STDIN_FILENO, CAT_BUFSZ, buf);
-          if (n <= 0) break;
-          fwrite(buf, 1, n, stdout);
-      }
-      return NULL;
-  }
-  char buf[CAT_BUFSZ];
+    char **argv = (char **)arg;
 
-  for (int i = 1; argv[i]; ++i) {
-    int fd = s_open(argv[i], K_O_RDONLY);
-    if (fd < 0) {
-      fprintf(stderr, "cat: %s: %s\n", argv[i],
-              PennFatErr_toErrString(fd));
-      continue;
+    /* no file arguments → copy stdin → stdout */
+    if (!argv || !argv[1]) {
+        char buf[CAT_BUFSZ];
+        int  n;
+        while ((n = s_read(STDIN_FILENO, CAT_BUFSZ, buf)) > 0)
+            s_write(STDOUT_FILENO, buf, n);
+        return NULL;
     }
-    while (1) {
-      PennFatErr r = s_read(fd, CAT_BUFSZ, buf);
-      if (r < 0) { fprintf(stderr, "cat: read error\n"); break; }
-      if (r == 0) break;
-      fwrite(buf, 1, r, stdout);
+
+    /* one or more file names */
+    for (int i = 1; argv[i]; ++i) {
+        int fd0 = s_open(argv[i], K_O_RDONLY);
+        if (fd0 < 0) {
+            fprintf(stderr, "cat: %s: %s\n", argv[i], strerror(errno));
+            continue;
+        }
+        int fd = ensure_nonstd_fd(argv[i], K_O_RDONLY, fd0);
+
+        char buf[CAT_BUFSZ];
+        int  n;
+        while ((n = s_read(fd, sizeof buf, buf)) > 0)
+            s_write(STDOUT_FILENO, buf, n);
+
+        if (fd >= 3)          /* never close 0/1/2 */
+            s_close(fd);
     }
-    s_close(fd);
-  }
-  return NULL;
+    return NULL;
 }
+
 
 /*----------- echo -----------------------------------------------------------*/
 void* echo(void* arg)
@@ -319,74 +362,121 @@ static void shell_install_handlers(void)
 /*  Data-moving built-ins: cp / mv / rm                                 */
 /*======================================================================*/
 
-/* cp  SRC DST  — copy a file inside PennFAT (no host –h support yet) */
-void* cp(void* arg)
+/* ---------- cp --------------------------------------------------- */
+void *cp(void *arg)
 {
-  char** argv = (char**)arg;
-  if (!argv || !argv[1] || !argv[2]) {
-    fprintf(stderr, "cp: usage: cp SRC DST\n");
-    return NULL;
-  }
-
-  const char* src = argv[1];
-  const char* dst = argv[2];
-
-  int src_fd = s_open(src, K_O_RDONLY);
-  if (src_fd < 0) {
-    fprintf(stderr, "cp: cannot open %s\n", src);
-    return NULL;
-  }
-  int dst_fd = s_open(dst, K_O_CREATE | K_O_WRONLY);
-  if (dst_fd < 0) {
-    fprintf(stderr, "cp: cannot create %s\n", dst);
-    s_close(src_fd);
-    return NULL;
-  }
-
-  char buf[4096];
-  while (1) {
-    PennFatErr n = s_read(src_fd, sizeof buf, buf);
-    if (n < 0) { fprintf(stderr, "cp: read error\n"); break; }
-    if (n == 0) break;                 /* EOF */
-    if (s_write(dst_fd, buf, n) != n) {
-      fprintf(stderr, "cp: write error\n");
-      break;
+    char **argv = (char **)arg;
+    if (!argv || !argv[1] || !argv[2]) {
+        fprintf(stderr, "cp: usage: cp SRC DST\n");
+        return NULL;
     }
-  }
+    const char *src = argv[1], *dst = argv[2];
 
-  s_close(src_fd);
-  s_close(dst_fd);
-  return NULL;
+    int sfd0 = s_open(src, K_O_RDONLY);
+    if (sfd0 < 0) {
+        fprintf(stderr, "cp: %s: %s\n", src, strerror(errno));
+        return NULL;
+    }
+    int sfd = ensure_nonstd_fd(src, K_O_RDONLY, sfd0);
+
+    int dfd0 = s_open(dst, K_O_CREATE | K_O_TRUNC | K_O_WRONLY);
+    if (dfd0 < 0) {
+        fprintf(stderr, "cp: %s: %s\n", dst, strerror(errno));
+        if (sfd >= 3) s_close(sfd);
+        return NULL;
+    }
+    int dfd = ensure_nonstd_fd(dst, K_O_CREATE | K_O_TRUNC | K_O_WRONLY, dfd0);
+
+    char buf[4096];
+    int  n;
+    while ((n = s_read(sfd, sizeof buf, buf)) > 0) {
+        if (s_write(dfd, buf, n) != n) {
+            fprintf(stderr, "cp: write error: %s\n", strerror(errno));
+            break;
+        }
+    }
+
+    if (sfd >= 3) s_close(sfd);
+    if (dfd >= 3) s_close(dfd);
+    return NULL;
 }
 
-/* mv  SRC DST  — rename inside PennFAT */
-void* mv(void* arg)
+/* ---------- rm ---------------------------------------------------- *
+ * Remove one or more files.  Each file is handled independently, so
+ * an error with f1 does not prevent attempts on f2, f3, …            *
+ * Behaviour:
+ *   • “No such file”   if the path does not exist
+ *   • “Permission denied” when the caller lacks write permission
+ *   • All other PennFAT errors are reported verbatim.               */
+void* rm(void *arg)
 {
-  char** argv = (char**)arg;
-  if (!argv || !argv[1] || !argv[2]) {
-    fprintf(stderr, "mv: usage: mv SRC DST\n");
-    return NULL;
-  }
+    char **argv = (char**)arg;
+    if (!argv || !argv[1]) {
+        fprintf(stderr, "rm: usage: rm FILE …\n");
+        return NULL;
+    }
 
-  if (s_rename(argv[1], argv[2]) != 0)
-    fprintf(stderr, "mv: cannot rename %s -> %s\n", argv[1], argv[2]);
-  return NULL;
+    for (int i = 1; argv[i]; ++i) {
+        PennFatErr err = s_unlink(argv[i]);
+        if (err == PennFatErr_OK)                       /* success */
+            continue;
+
+        /* translate common errors for user friendliness */
+        if (pennfat_is_noent(err))
+            fprintf(stderr, "rm: %s: No such file\n", argv[i]);
+        else if (pennfat_is_perm(err))
+            fprintf(stderr, "rm: %s: Permission denied\n", argv[i]);
+        else
+            fprintf(stderr, "rm: %s: %s\n",
+                    argv[i], PennFatErr_toErrString(err));
+    }
+    return NULL;
 }
 
-/* rm  FILE…  — delete one or more files */
-void* rm(void* arg)
+/* ---------- mv (updated) ---------- */
+void* mv(void *arg)
 {
-  char** argv = (char**)arg;
-  if (!argv || !argv[1]) {
-    fprintf(stderr, "rm: usage: rm FILE...\n");
-    return NULL;
-  }
+    char **argv = (char**)arg;
+    if (!argv || !argv[1] || !argv[2]) {
+        fprintf(stderr, "mv: usage: mv SRC DST\n");
+        return NULL;
+    }
+    const char *src = argv[1], *dst = argv[2];
 
-  for (int i = 1; argv[i]; ++i) {
-    if (s_unlink(argv[i]) != 0)
-      fprintf(stderr, "rm: cannot remove %s\n", argv[i]);
-  }
-  return NULL;
+    /* 1. Make sure SRC exists & is readable */
+    int fd = s_open(src, K_O_RDONLY);
+    if (fd < 0) {
+        if (errno == ENOENT)
+            fprintf(stderr, "mv: %s: No such file\n", src);
+        else if (errno == EACCES)
+            fprintf(stderr, "mv: %s: Permission denied (read)\n", src);
+        else
+            perror("mv");
+        return NULL;
+    }
+    s_close(fd);
+
+    /* 2. If DST already exists, verify write permission                */
+    fd = s_open(dst, K_O_WRONLY);          /* no K_O_CREATE here       */
+    if (fd >= 0) {
+        s_close(fd);                       /* write-able, good         */
+    } else if (errno == EACCES) {          /* exists but RO           */
+        fprintf(stderr,
+                "mv: %s: Permission denied (write overwrite)\n", dst);
+        return NULL;
+    }
+    /* ENOENT here is fine – file does not exist → will be created */
+
+    /* 3. Try the rename itself                                        */
+    if (s_rename(src, dst) != 0) {
+        if (errno == EACCES)
+            fprintf(stderr,
+                    "mv: cannot rename %s → %s: Permission denied\n",
+                    src, dst);
+        else
+            perror("mv");
+    }
+    return NULL;
 }
 
 
@@ -407,9 +497,16 @@ void* shell_main(void* arg) {
   shell_install_handlers();                                     /* step 6 */
 
   while (!exit_shell) {
-        /* ── 1. reap all dead children synchronously (NOHANG) ─────────── */
-    while (s_waitpid(-1, NULL, true) > 0)   /* discard status */
-        ;
+            int st;
+        pid_t kid;
+        while ((kid = s_waitpid(-1, &st, true)) > 0) {
+            if (P_WIFSTOPPED(st))
+                jobs_update(kid, JOB_STOPPED);
+            else if (P_WIFSIGNALED(st) || P_WIFEXITED(st))
+                jobs_update(kid, JOB_DONE);
+            else if (st == P_SIGCONT)
+                jobs_update(kid, JOB_RUNNING);
+        }
 
     free(cmd);
 
@@ -438,36 +535,6 @@ void* shell_main(void* arg) {
        *  possibly create one or many child processes.
        * ────────────────────────────────────────────────────────────*/
 
-  /*----------------------------------------------*
- *  Handle <  >  >>  from the parsed structure  *
- *----------------------------------------------*/
-int redir_in  = STDIN_FILENO;   /* default: inherit from shell */
-int redir_out = STDOUT_FILENO;
-bool close_in  = false;         /* whether we must k_close later */
-bool close_out = false;
-
-/* open input redirection, if any */
-if (cmd->stdin_file) {
-  int fd = open_for_read(cmd->stdin_file);
-  if (fd < 0) {
-    fprintf(stderr, "shell: cannot open %s for reading\n", cmd->stdin_file);
-    goto AFTER_LOOP_CLEANUP;
-  }
-  redir_in = fd;  close_in = true;
-}
-
-/* open output redirection, if any */
-if (cmd->stdout_file) {
-  int fd = open_for_write(cmd->stdout_file, cmd->is_file_append);
-  if (fd < 0) {
-    fprintf(stderr, "shell: cannot open %s (%s)\n", cmd->stdout_file, PennFatErr_toErrString(fd));
-    if (close_in) s_close(redir_in);
-    goto AFTER_LOOP_CLEANUP;
-  }
-  redir_out = fd;  close_out = true;
-}
-
-
  pid_t child_pid = process_one_command(cmd->commands,
                                         cmd->num_commands,
                                          cmd->stdin_file,
@@ -492,11 +559,7 @@ if (cmd->stdout_file) {
 
     }
 
-    if (close_in)  s_close(redir_in);
-    if (close_out) s_close(redir_out);
-
-    AFTER_LOOP_CLEANUP:
-    ;   /* empty statement so the label isn’t alone */
+    
   }
 
   if (cmd) free(cmd);        /* guard against the last continue */
@@ -582,7 +645,11 @@ void* kill_cmd(void* arg) {            /* ➋ renamed implementation   */
   }
 
   if (s_kill(pid, signal) == 0) {
-    // fprintf(stderr, "Signal <%d> sent to PID [%d].\n", signal, pid);
+       switch (signal) {
+              case P_SIGSTOP: jobs_update(pid, JOB_STOPPED);           break;
+              case P_SIGCONT: jobs_update(pid, JOB_RUNNING);           break;
+              case P_SIGTERM: jobs_update(pid, JOB_DONE);              break;
+          }
   } else {
     // TODO: errno checking, more verbose error explanation
     fprintf(stderr, "Error sending signal to PID [%d].\n", pid);
@@ -742,10 +809,10 @@ static struct parsed_command* read_command() {
   ssize_t bytes_read;
 
 
-    fprintf(stderr, "\033[1m");
+    // fprintf(stderr, "\033[1m");
     errno = 0;                                       /* keep EINTR       */
     bytes_read = read(STDIN_FILENO, buf, buf_len - 1);
-    fprintf(stderr, "\033[0m");
+    // fprintf(stderr, "\033[0m");
 
   if (bytes_read >= 0) {
     buf[bytes_read] = '\0';
@@ -793,35 +860,80 @@ static struct parsed_command* read_command() {
   return pcmd_ptr;
 }
 
-/*  NEW built-ins: jobs / bg / fg / logout – step 7               */
-void* jobs_builtin(void* arg) { jobs_list(); return NULL; }
-
-void* bg(void* arg)
+void* jobs_builtin(void* _arg)          /* jobs : list every job        */
 {
-  char** argv = (char**)arg;
-  int jid = argv[1] ? atoi(argv[1]+1) : -1;           /* %N form          */
-  job_t *j = (jid > 0) ? jobs_by_jid(jid) : NULL;
-  if (!j) { fprintf(stderr, "bg: job not found\n"); return NULL; }
-  s_kill(j->pid, P_SIGCONT);
-  j->state = JOB_RUNNING;
-  fprintf(stderr, "[%d] %s &\n", j->jid, j->cmdline);
-  return NULL;
+    (void)_arg;
+    jobs_list();
+    return NULL;
 }
 
+/* bg [ %jid ]  – resume most-recent stopped job in background  */
+void* bg(void* arg)
+{
+    char **argv = (char**)arg;
+    job_t *j = NULL;
+
+    if (argv[1]) {                                   /* explicit %N     */
+        int jid = (argv[1][0] == '%') ? atoi(argv[1]+1) : atoi(argv[1]);
+        j = jobs_by_jid(jid);
+    } else {                                         /* pick latest S   */
+        j = jobs_most_recent(1 << JOB_STOPPED);
+    }
+
+    if (!j) { fprintf(stderr, "bg: job not found\n"); return NULL; }
+    if (j->state == JOB_RUNNING) {
+        fprintf(stderr, "bg: job already running\n");
+        return NULL;
+    }
+
+    s_kill(j->pid, P_SIGCONT);
+    jobs_update(j->pid, JOB_RUNNING);
+    fprintf(stderr, "[%d] %s &\n", j->jid, j->cmdline);
+    return NULL;
+}
+
+
+/* fg [ %jid ]  – put job in foreground (stopped *or* background)       */
 void* fg(void* arg)
 {
-  char** argv = (char**)arg;
-  int jid = argv[1] ? atoi(argv[1]+1) : -1;
-  job_t *j = (jid > 0) ? jobs_by_jid(jid) : jobs_current_fg();
-  if (!j) { fprintf(stderr, "fg: job not found\n"); return NULL; }
+    extern pid_t fg_pid;             /* declared earlier in shell.c      */
+    char **argv = (char**)arg;
+    job_t *j = NULL;
 
-  s_kill(j->pid, P_SIGCONT);
-  j->state = JOB_RUNNING;
-  s_tcsetpid(j->pid);
-  s_waitpid(j->pid, NULL, true);
-  s_tcsetpid(shell_pgid);
-  jobs_remove(j->pid);
-  return NULL;
+    if (argv[1]) {
+        int jid = (argv[1][0] == '%') ? atoi(argv[1]+1) : atoi(argv[1]);
+        j = jobs_by_jid(jid);
+    } else {
+        j = jobs_most_recent((1 << JOB_STOPPED) | (1 << JOB_RUNNING));
+    }
+
+    if (!j) { fprintf(stderr, "fg: job not found\n"); return NULL; }
+
+    s_kill(j->pid, P_SIGCONT);                   /* make sure it runs   */
+    jobs_update(j->pid, JOB_RUNNING);
+
+    fg_pid = j->pid;                             /* for signal forward  */
+    s_tcsetpid(j->pid);                          /* terminal to job     */
+
+    /* block-wait until it stops again or terminates */
+    int status;
+    while (true) {
+        s_waitpid(j->pid, &status, false);       /* blocking wait       */
+                if (P_WIFSTOPPED(status)) {
+                      jobs_update(j->pid, JOB_STOPPED);
+                      fprintf(stderr,"[%d] Stopped  %s\n", j->jid, j->cmdline);
+                      break;
+                  }
+                  if (P_WIFEXITED(status) || P_WIFSIGNALED(status)) {
+                      fprintf(stderr,"[%d] Done     %s\n", j->jid, j->cmdline);
+                      jobs_remove(j->pid);
+                      break;
+                  }
+    }
+
+    s_tcsetpid(shell_pgid);                      /* shell regains tty   */
+    fg_pid = 0;
+    return NULL;
 }
 
 void* logout_cmd(void* arg)

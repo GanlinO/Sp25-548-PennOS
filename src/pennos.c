@@ -1,88 +1,86 @@
-/* src/pennos.c */
-
-#include "internal/process_control.h"
-#include "internal/pennfat_kernel.h"
-#include "common/pennfat_errors.h"
-#include "user/shell.h"
-#include "util/logger.h"
-#include "syscall/syscall_kernel.h"   /* ⟵ s_spawn / s_waitpid / s_sleep   */
+// ─── src/pennos.c ────────────────────────────────────────────
+//  PennOS kernel bootstrap & PennFAT integration
+//  (updated to satisfy spec §5 – fatfs image + optional log file)
+// -------------------------------------------------------------------
+#include "../internal/process_control.h"          // k_kernel_start …
+#include "../internal/pennfat_kernel.h"           // k_mount / k_mkfs …
+#include "../util/logger.h"
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <errno.h>
 
-/* ─────────────────────────────────────────────── prototypes ─────────── */
-static void print_welcome_banner(void);
+/* ------------------------------------------------------------------ */
+/*                      command‑line processing                       */
+/* ------------------------------------------------------------------ */
+static const char *fatfs_path = NULL;    /* mandatory */
+static const char *log_path   = "pennos";  /* default   */
 
-/* ─────────────────────────────────────────────── entry point ─────────── */
-int main(int argc, char *argv[])
+static void usage(const char *prog)
 {
-    print_welcome_banner();
-
-    /**********************************************************************
-     * 1. (optional) CLI parsing – still TODO                             *
-     *********************************************************************/
-    const char *fs_image = "disk.img";          /* default while testing  */
-
-    /**********************************************************************
-     * 2.  PennFAT initialisation  +  “create-if-missing” mount           *
-     *********************************************************************/
-    pennfat_kernel_init();                      /* kernel-side structures */
-
-    /* first try a normal mount … */
-    PennFatErr err = k_mount(fs_image);
-
-    if (err != PennFatErr_SUCCESS) {
-        fprintf(stderr,
-                "PennOS: %s is not a valid PennFAT image (%s). "
-                "Creating a new one …\n",
-                fs_image, PennFatErr_toErrString(err));
-
-        /* format: 4 FAT blocks, block-size config 0 (512 B)               */
-        const int FAT_BLOCKS = 4;
-        const int BS_CFG     = 0;
-
-        PennFatErr mkfs_err = k_mkfs(fs_image, FAT_BLOCKS, BS_CFG);
-        if (mkfs_err != PennFatErr_SUCCESS) {
-            fprintf(stderr,
-                    "mkfs(%s) failed: %s\n",
-                    fs_image, PennFatErr_toErrString(mkfs_err));
-            exit(EXIT_FAILURE);
-        }
-
-        /* … and try the mount again                                      */
-        err = k_mount(fs_image);
-        if (err != PennFatErr_SUCCESS) {
-            fprintf(stderr,
-                    "Mount after mkfs still failed: %s\n",
-                    PennFatErr_toErrString(err));
-            exit(EXIT_FAILURE);
-        }
-
-        fprintf(stderr, "✓ New image created and mounted.\n");
-    } else {
-        fprintf(stderr, "✓ Mounted existing image %s\n", fs_image);
-    }
-
-    /**********************************************************************
-     * 3.  start kernel + shell                                           *
-     *********************************************************************/
-
-        fprintf(stderr, "Starting kernel …\n");
-        /* start kernel – its own INIT (PID 1) will run shell_main() */
-        k_kernel_start(shell_main, NULL);            /* blocks until shutdown  */
-
-    /**********************************************************************
-     * 4.  unmount & cleanup                                              *
-     *********************************************************************/
-    k_unmount();
-    pennfat_kernel_cleanup();
-
-    fprintf(stderr, "PennOS shut down.  Goodbye!\n");
-    return EXIT_SUCCESS;
+    fprintf(stderr,
+            "usage: %s fatfs [log_fname]\n"
+            "        fatfs      – host‑file that *contains* the PennFAT image\n"
+            "        log_fname  – host‑side log file (default: ./log)\n",
+            prog);
+    exit(EXIT_FAILURE);
 }
 
-/* ─────────────────────────────────────────────── banner (unchanged) ──── */
-static void print_welcome_banner(void)
+static void parse_args(int argc, char **argv)
 {
-    /* …  your existing banner code … */
+    if (argc < 2 || argc > 3)
+        usage(argv[0]);
+
+    fatfs_path = argv[1];
+    if (argc == 3) log_path = argv[2];
+}
+
+/* ------------------------------------------------------------------ */
+/*                             utilities                             */
+/* ------------------------------------------------------------------ */
+static void ensure_image_exists(void)
+{
+    struct stat st;
+    if (stat(fatfs_path, &st) == 0) return;          /* already there */
+
+    fprintf(stderr, "[%s] image not found – creating new PennFAT FS …\n",
+            fatfs_path);
+    PennFatErr e = k_mkfs(fatfs_path, /*blocks_in_fat*/100, /*blk_size*/4096);
+    if (e != PennFatErr_OK) {
+        fprintf(stderr, "mkfs(%s) failed: %d\n", fatfs_path, e);
+        exit(EXIT_FAILURE);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*                         program entry‑point                        */
+/* ------------------------------------------------------------------ */
+extern void *shell_main(void *arg);   /* defined in shell.c */
+
+int main(int argc, char **argv)
+{
+    /* ➊ parse CLI -------------------------------------------------- */
+    parse_args(argc, argv);
+
+    /* ➋ host‑side logger ------------------------------------------ */
+    logger_init(log_path, LOG_LEVEL_INFO);   // writes on the host FS
+
+    /* ➌ PennFAT bootstrap ----------------------------------------- */
+    pennfat_kernel_init();                   // core structures
+    ensure_image_exists();
+    if (k_mount(fatfs_path) != PennFatErr_OK) {
+        fprintf(stderr, "cannot mount %s: %s\n", fatfs_path, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    /* ➍ launch kernel scheduler + shell --------------------------- */
+    k_kernel_start(shell_main, NULL);
+
+    /* ➎ graceful shutdown ----------------------------------------- */
+    k_unmount();
+    pennfat_kernel_cleanup();
+    logger_close(NULL);
+    return 0;
 }

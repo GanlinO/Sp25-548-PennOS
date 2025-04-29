@@ -276,7 +276,7 @@ void pcb_fd_close(pcb_t *p, int ufd)
     proc_fd_entry_t *tmp;
     if (pcb_fd_get(p, ufd, &tmp) == -1) return;   /* nothing to do */
 
-    free(tmp);                                    /* release entry  */
+    // free(tmp);                                    /* release entry  */
     vec_set_force(&p->fds, ufd, NULL);            /* make a hole    */
 }
 

@@ -9,6 +9,7 @@
 #define K_O_RDONLY     0x2
 #define K_O_WRONLY    0x4
 #define K_O_APPEND   0x8
+#define K_O_TRUNC    0x10
 
 #define HAS_CREATE(mode)  (((mode) & K_O_CREATE) != 0)
 #define HAS_READ(mode)    (((mode) & K_O_RDONLY) != 0)

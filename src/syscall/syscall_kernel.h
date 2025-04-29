@@ -15,7 +15,6 @@ PennFatErr  s_ls    (const char *path /* or NULL = CWD */);
 PennFatErr  s_chmod (const char *path, uint8_t perm);
 int         s_rename(const char *oldp, const char *newp);   /* 0 / -1 */
 int         s_unlink(const char *path);                     /* 0 / -1 */
-
 /**
  * @brief Create a child process that executes the function `func`.
  * The child will retain some attributes of the parent.

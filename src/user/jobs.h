@@ -27,5 +27,6 @@ job_t *jobs_current_fg(void);          /* foreground job or NULL           */
 void   jobs_list(void);                /* built-in `jobs` output           */
 bool   jobs_have_stopped(void);        /* for `logout` guard               */
 void jobs_shutdown(void);
+job_t *jobs_most_recent(int wanted_mask);
 
 #endif /* JOBS_H */

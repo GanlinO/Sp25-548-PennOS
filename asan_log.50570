@@ -1,0 +1,54 @@
+=================================================================
+==50570==ERROR: AddressSanitizer: attempting double-free on 0x602000004050 in thread T2:
+    #0 0x55593ff34cb2  (/root/workspace/pennos/bin/pennos+0xaecb2) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #1 0x55593ff9bf9b  (/root/workspace/pennos/bin/pennos+0x115f9b) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #2 0x55593ff9c039  (/root/workspace/pennos/bin/pennos+0x116039) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #3 0x55593ff83563  (/root/workspace/pennos/bin/pennos+0xfd563) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #4 0x55593ff8dde3  (/root/workspace/pennos/bin/pennos+0x107de3) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #5 0x55593ff9271d  (/root/workspace/pennos/bin/pennos+0x10c71d) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #6 0x55593ff91588  (/root/workspace/pennos/bin/pennos+0x10b588) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #7 0x55593ff8c826  (/root/workspace/pennos/bin/pennos+0x106826) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #8 0x55593ff99570  (/root/workspace/pennos/bin/pennos+0x113570) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #9 0x7f945ec36ac2  (/lib/x86_64-linux-gnu/libc.so.6+0x94ac2) (BuildId: 490fef8403240c91833978d494d39e537409b92e)
+    #10 0x7f945ecc884f  (/lib/x86_64-linux-gnu/libc.so.6+0x12684f) (BuildId: 490fef8403240c91833978d494d39e537409b92e)
+
+0x602000004050 is located 0 bytes inside of 4-byte region [0x602000004050,0x602000004054)
+freed by thread T2 here:
+    #0 0x55593ff34cb2  (/root/workspace/pennos/bin/pennos+0xaecb2) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #1 0x55593ff8354e  (/root/workspace/pennos/bin/pennos+0xfd54e) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #2 0x55593ff8dde3  (/root/workspace/pennos/bin/pennos+0x107de3) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #3 0x55593ff9271d  (/root/workspace/pennos/bin/pennos+0x10c71d) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #4 0x55593ff91588  (/root/workspace/pennos/bin/pennos+0x10b588) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #5 0x55593ff8c826  (/root/workspace/pennos/bin/pennos+0x106826) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #6 0x55593ff99570  (/root/workspace/pennos/bin/pennos+0x113570) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #7 0x7f945ec36ac2  (/lib/x86_64-linux-gnu/libc.so.6+0x94ac2) (BuildId: 490fef8403240c91833978d494d39e537409b92e)
+
+previously allocated by thread T2 here:
+    #0 0x55593ff34f5e  (/root/workspace/pennos/bin/pennos+0xaef5e) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #1 0x55593ff8d5a6  (/root/workspace/pennos/bin/pennos+0x1075a6) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #2 0x55593ff94b0e  (/root/workspace/pennos/bin/pennos+0x10eb0e) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #3 0x55593ff92421  (/root/workspace/pennos/bin/pennos+0x10c421) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #4 0x55593ff91588  (/root/workspace/pennos/bin/pennos+0x10b588) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #5 0x55593ff8c826  (/root/workspace/pennos/bin/pennos+0x106826) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #6 0x55593ff99570  (/root/workspace/pennos/bin/pennos+0x113570) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #7 0x7f945ec36ac2  (/lib/x86_64-linux-gnu/libc.so.6+0x94ac2) (BuildId: 490fef8403240c91833978d494d39e537409b92e)
+
+Thread T2 created by T1 here:
+    #0 0x55593ff1dcec  (/root/workspace/pennos/bin/pennos+0x97cec) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #1 0x55593ff98e07  (/root/workspace/pennos/bin/pennos+0x112e07) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #2 0x55593ff858c2  (/root/workspace/pennos/bin/pennos+0xff8c2) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #3 0x55593ff89a58  (/root/workspace/pennos/bin/pennos+0x103a58) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #4 0x55593ff99570  (/root/workspace/pennos/bin/pennos+0x113570) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #5 0x7f945ec36ac2  (/lib/x86_64-linux-gnu/libc.so.6+0x94ac2) (BuildId: 490fef8403240c91833978d494d39e537409b92e)
+
+Thread T1 created by T0 here:
+    #0 0x55593ff1dcec  (/root/workspace/pennos/bin/pennos+0x97cec) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #1 0x55593ff98e07  (/root/workspace/pennos/bin/pennos+0x112e07) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #2 0x55593ff858df  (/root/workspace/pennos/bin/pennos+0xff8df) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #3 0x55593ff83b77  (/root/workspace/pennos/bin/pennos+0xfdb77) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #4 0x55593ff835e1  (/root/workspace/pennos/bin/pennos+0xfd5e1) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #5 0x55593ff9cd6f  (/root/workspace/pennos/bin/pennos+0x116d6f) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036)
+    #6 0x7f945ebcbd8f  (/lib/x86_64-linux-gnu/libc.so.6+0x29d8f) (BuildId: 490fef8403240c91833978d494d39e537409b92e)
+
+SUMMARY: AddressSanitizer: double-free (/root/workspace/pennos/bin/pennos+0xaecb2) (BuildId: d3c8a86a0c7e9433345e1214f6f7d5f257818036) 
+==50570==ABORTING

@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdio.h>
 #include "../syscall/syscall_kernel.h"     /* s_spawn, s_kill, … */
+#include <ctype.h>          /* ← for isspace() */
 
 #define MAX_JOBS 64
 
@@ -15,7 +16,7 @@ static pid_t helper_pid = -1;
 
 static job_t table[MAX_JOBS];
 static int    next_jid = 1;
-static int    fg_index = -1;              /* index of foreground job       */
+static int    fg_index = -1;      /* index of foreground job   */
 
 /* ───────── helpers ───────── */
 static int find_empty_slot(void)
@@ -31,40 +32,11 @@ static int index_by_pid(pid_t pid)
     return -1;
 }
 
-/* ───────── SIGCHLD handler ───────── */
-static void chld_handler(int _unused)
-{
-    /* iterate over **known** jobs only                                */
-    for (int i = 0; i < MAX_JOBS; ++i) {
-        if (table[i].jid == 0)               /* slot unused           */
-            continue;
-
-        int   status;
-        pid_t pid = s_waitpid(table[i].pid, &status, true);  /* NOHANG */
-        if (pid <= 0)                       /* nothing new            */
-            continue;
-
-        /* we reaped a background/-pipeline job                       */
-        if      (P_WIFSTOPPED(status)) table[i].state = JOB_STOPPED;
-        else if (status == P_SIGCONT)   table[i].state = JOB_RUNNING;
-        else                            table[i].state = JOB_DONE;
-
-        if (i == fg_index && table[i].state != JOB_RUNNING)
-            fg_index = -1;
-    }
-}
 
 /* ───────── public API ───────── */
 void jobs_init(void)
 {
     memset(table, 0, sizeof table);
-
-    struct sigaction sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sa_handler = chld_handler;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGCHLD, &sa, NULL);
-
     helper_pid = -1;
 }
 
@@ -82,7 +54,30 @@ int jobs_add(pid_t pid, const char *cmdline, bool bg)
     table[idx].jid   = next_jid++;
     table[idx].pid   = pid;
     table[idx].state = JOB_RUNNING;
-    strncpy(table[idx].cmdline, cmdline, sizeof(table[idx].cmdline) - 1);
+
+       /* -----------------------------------------------------------
+    * 1. take length up to buffer limit
+    * 2. drop the final '\n' (entered by user <RET>)
+    * 3. drop optional trailing " &" (space + ampersand)
+    * --------------------------------------------------------- */
+   size_t n = strnlen(cmdline, sizeof(table[idx].cmdline) - 1);
+
+   /* step-2 : strip newline / trailing blanks ------------------ */
+   while (n > 0 && isspace((unsigned char)cmdline[n-1]))
+       --n;                         /* removes '\n' and spaces    */
+
+   /* step-3 : strip “ &” --------------------------------------- */
+   if (n >= 2 && cmdline[n-1] == '&' &&
+       isspace((unsigned char)cmdline[n-2])) {
+       n -= 2;                      /* drop & and the preceding space */
+       /* strip any extra spaces that might precede it             */
+       while (n > 0 && isspace((unsigned char)cmdline[n-1]))
+           --n;
+   }
+
+
+   memcpy(table[idx].cmdline, cmdline, n);
+   table[idx].cmdline[n] = '\0';
 
     if (!bg) fg_index = idx;
     return table[idx].jid;
@@ -105,7 +100,9 @@ job_t *jobs_by_jid(int jid)
     for (int i = 0; i < MAX_JOBS; ++i)
         if (table[i].jid == jid) return &table[i];
     return NULL;
+
 }
+
 job_t *jobs_current_fg(void)
 {
     return (fg_index >= 0) ? &table[fg_index] : NULL;
@@ -116,6 +113,20 @@ bool jobs_have_stopped(void)
         if (table[i].jid && table[i].state == JOB_STOPPED) return true;
     return false;
 }
+
+/* return the *latest* job whose state bit appears in wanted_mask
+ * wanted_mask is a bitmap:  (1<<JOB_RUNNING) | (1<<JOB_STOPPED) | …   */
+job_t *jobs_most_recent(int wanted_mask)
+{
+    for (int i = MAX_JOBS - 1; i >= 0; --i) {
+        if (table[i].jid == 0)                /* unused slot         */
+            continue;
+        if (wanted_mask & (1 << table[i].state))
+            return &table[i];
+    }
+    return NULL;
+}
+
 void jobs_list(void)
 {
     for (int i = 0; i < MAX_JOBS; ++i) if (table[i].jid) {

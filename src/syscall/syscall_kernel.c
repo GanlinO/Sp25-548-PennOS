@@ -172,7 +172,11 @@ int s_open(const char *name, int mode)
 
     pcb_t *self = k_get_self_pcb();
     int ufd = pcb_fd_alloc(self, ent);   /*  ←—— one call, all checks done */
-    if (ufd == -1) { k_close(kfd); free(ent); return -1; }
+    if (ufd == -1) { 
+      k_close(kfd); 
+      free(ent); 
+      return -1; 
+    }
 
     return ufd;
 }
@@ -213,7 +217,6 @@ int s_close(int fd)
         return -1;                              /* EBADF already set   */
 
     int rc = k_close(ent->kfd);
-    free(ent);
     pcb_fd_close(self, fd);                      /* helper ← sets slot NULL */
 
     if (rc < 0) { errno = xlate_err(rc); return -1; }
@@ -249,5 +252,3 @@ int s_unlink(const char *p)
     if (r != PennFatErr_OK) { errno = xlate_err(r); return -1; }
     return 0;
 }
-
-
