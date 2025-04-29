@@ -1554,6 +1554,11 @@ pid_t k_waitpid(pid_t pid, int* wstatus, bool nohang) {
   pcb_t* child_pcb = NULL;      // pcb null indicates wait for any child in this function
   pcb_t* self_pcb = k_get_self_pcb();
 
+  if (vec_len(&self_pcb->children) == 0) {
+    errno = ECHILD;            /* POSIX semantics            */
+    return -1;
+}
+
   // check whether the specified PID is indeed a child
   if (pid != -1) {
     child_pcb = get_pcb_at_pid(pid);

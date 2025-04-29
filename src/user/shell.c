@@ -1,4 +1,5 @@
 #include "shell.h"
+#include "../user/stress.h"
 #include "../syscall/syscall_kernel.h"
 #include "../common/pennos_signals.h"
 #include "../util/parser.h"
@@ -62,6 +63,10 @@ static cmd_func_match_t independent_funcs[] = {
     {"cp",        cp},
   {"mv",        mv},
   {"rm",        rm},
+  {"hang",   hang},
+  {"nohang", nohang},
+  {"recur",  recur},
+  {"crash",  crash},
   {NULL, NULL}
 };
 

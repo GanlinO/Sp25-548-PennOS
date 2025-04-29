@@ -12,7 +12,7 @@ CFLAGS = -g3 -gdwarf-4 -pthread -Wall -Werror -Wno-gnu -O0 -g --std=gnu2x
 CXXFLAGS = -g3 -gdwarf-4 -pthread -Wall -Werror -Wno-gnu -O0 -g --std=gnu++2b
 
 # tells it to search for 
-CPPFLAGS = -I $(SRC_DIR)
+CPPFLAGS = -I $(SRC_DIR) -I $(SRC_DIR)/user
 
 # add each test name to this list
 # for example:
