@@ -6,9 +6,9 @@
 
 /* PennFAT wrappers --------------------------------------------------- */
 int         s_open (const char *path, int mode);
-PennFatErr  s_close(int fd);
-PennFatErr  s_read (int fd, int n, char *buf);
-PennFatErr  s_write(int fd, const char *buf, int n);
+int         s_close(int fd);
+int         s_read (int fd, int n, char *buf);
+int         s_write(int fd, const char *buf, int n);
 
 PennFatErr  s_touch (const char *path);
 PennFatErr  s_ls    (const char *path /* or NULL = CWD */);

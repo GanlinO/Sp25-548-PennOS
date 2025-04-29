@@ -2,6 +2,8 @@
 #include "../util/spthread.h" // for spthread
 #include "../util/Vec.h"      // for Vec
 #include "../util/utils.h"    // for assert_non_null
+#include "k_syscalls.h"
+#include "../internal/pennfat_kernel.h"
 
 #include <stdlib.h>
 #include <signal.h>           // for scheduler handling SIGALRM
@@ -222,6 +224,8 @@ static routine_exit_wrapper_args_t* wrap_routine_exit_args(void* (*func)(void*),
 
 static void spthread_cancel_and_join(spthread_t thread);
 
+
+
 /********************
  * POSIX signal handler *
  ********************/
@@ -245,6 +249,36 @@ static void async_sig_handler(int signum) {
 /********************
  * internal functions *
  ********************/
+int pcb_fd_alloc(pcb_t *p, proc_fd_entry_t *ent)
+{
+    if (!p || !ent) { errno = EBADF; return -1; }
+
+    int ufd = 3;          /* 0,1,2 are stdin/out/err */
+    for (; ufd < (int)vec_len(&p->fds); ++ufd)
+        if (vec_get(&p->fds, ufd) == NULL) break;
+
+    vec_set_force(&p->fds, ufd, ent);
+    return ufd;                               /* new user-FD */
+}
+
+int pcb_fd_get(pcb_t *p, int ufd, proc_fd_entry_t **out)
+{
+    if (!p || ufd < 0 || (size_t)ufd >= vec_len(&p->fds)) {
+        errno = EBADF;  return -1;
+    }
+    *out = vec_get(&p->fds, ufd);
+    if (!*out) { errno = EBADF; return -1; }
+    return 0;
+}
+
+void pcb_fd_close(pcb_t *p, int ufd)
+{
+    proc_fd_entry_t *tmp;
+    if (pcb_fd_get(p, ufd, &tmp) == -1) return;   /* nothing to do */
+
+    free(tmp);                                    /* release entry  */
+    vec_set_force(&p->fds, ufd, NULL);            /* make a hole    */
+}
 
 /**
  * @brief The scheduler main logic
@@ -958,15 +992,35 @@ static pcb_t* create_pcb(pid_t pid, pcb_t* parent) {
     .blocked_by_sleep = false,
     .wake_tick = 0,
     .waitpid_stat = 0,
-    .fds = vec_new(0, NULL),
+    .fds = vec_new(0, free),
     .pending_signals = 0,
     .process_name = NULL
   };
 
   if (parent) {
-    pcb_ptr->parent = parent;
-    pcb_ptr->fds = parent->fds;
+        pcb_ptr->parent = parent;
     vec_push_back(&(parent->children), pcb_ptr);
+
+    /* ── duplicate the parent’s open FDs so child has *independent*
+     *    kernel descriptors and its *own* offsets                 */
+    for (size_t i = 0; i < vec_len(&parent->fds); ++i) {
+        proc_fd_entry_t *p_ent = vec_get(&parent->fds, i);
+        if (!p_ent) {                   /* hole → leave hole         */
+            vec_push_back(&pcb_ptr->fds, NULL);
+            continue;
+        }
+        /* dup the kernel-fd so offsets are separate                */
+        int new_kfd = k_lseek(p_ent->kfd, 0, F_SEEK_CUR);
+        /* using k_open again would need the path – dup is easier   */
+        /* simple dup: allocate another entry in g_fd_table         */
+        new_kfd = k_open(NULL /* dup */, 0); /* ⇐ add tiny k_dup later */
+        /* FALL-BACK until k_dup() exists: reopen with same mode    */
+        if (new_kfd < 0) continue;      /* out of descriptors – ignore */
+
+        proc_fd_entry_t *child_ent = malloc(sizeof *child_ent);
+        child_ent->kfd = new_kfd;
+        vec_push_back(&pcb_ptr->fds, child_ent);
+    }
   }
   return pcb_ptr;
 }

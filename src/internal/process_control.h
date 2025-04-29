@@ -5,8 +5,25 @@
 #include "../common/pennos_signals.h"
 #include "../util/logger.h"   // for logging requirement
 
-/* process control block, intentional hidden implementation */
-typedef struct pcb_t pcb_t;
+/* ------------------------------------------------------------------ *
+ * Forward declarations                                               *
+ * ------------------------------------------------------------------ */
+
+typedef struct pcb_t pcb_t;              /* the (opaque) PCB structure   */
+
+/* per-process user-FD table entry                                    */
+typedef struct proc_fd_entry {
+        int kfd;                         /* kernel-level FD (from k_open)*/
+} proc_fd_entry_t;
+
+
+int  pcb_fd_alloc (pcb_t *p, proc_fd_entry_t *ent);
+
+/* look up a user-FD → *out; 0 on success, –1 + errno (EBADF) on failure    */
+int  pcb_fd_get   (pcb_t *p, int ufd, proc_fd_entry_t **out);
+
+/* close & forget a user-FD (silently ignore bad)                           */
+void pcb_fd_close (pcb_t *p, int ufd);
 
 /**
  * @brief The entry point of the process control module. The OS should call this to start

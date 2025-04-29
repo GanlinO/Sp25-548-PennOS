@@ -1,11 +1,23 @@
 /* ─── src/syscall/syscall_kernel.c ───────────────────────────────────────── */
 #include "syscall_kernel.h"
 #include "../internal/process_control.h"
-// #include "../internal/pennfat_kernel.h"
+#include "../internal/pennfat_kernel.h"
 #include "../util/utils.h"
 #include <errno.h>
 #include <unistd.h>   // dup2, close
 #include <stdlib.h>
+
+
+/* helper: translate PennFAT errors → errno */
+static int xlate_err(int e)
+{
+    switch (e) {
+        case PennFatErr_PERM:  return EACCES;
+        case PennFatErr_NOSPACE:return ENOSPC;
+        case PennFatErr_EXISTS:return ENOENT;
+        default:               return EIO;
+    }
+}
 
 /* ---------- internal helper to pass (fd0,fd1) to the new routine -------- */
 
@@ -148,13 +160,78 @@ static void map_errno(PennFatErr e)
 }
 
 /* thin 1-to-1 shims -------------------------------------------------- */
-int s_open(const char *p,int m){ int r=k_open(p,m);
-    if(r<0){ map_errno(r);} return r; }
+/* ---------- s_open -------------------------------------------- */
+int s_open(const char *name, int mode)
+{
+    int kfd = k_open(name, mode);
+    if (kfd < 0) { errno = xlate_err(kfd); return -1; }
 
-PennFatErr s_close(int fd){ return k_close(fd); }
+    proc_fd_entry_t *ent = malloc(sizeof *ent);
+    if (!ent) { k_close(kfd); errno = ENOMEM; return -1; }
+    ent->kfd = kfd;
 
-PennFatErr s_read (int fd,int n,char *b){ return k_read (fd,n,b); }
-PennFatErr s_write(int fd,const char *b,int n){ return k_write(fd,b,n); }
+    pcb_t *self = k_get_self_pcb();
+    int ufd = pcb_fd_alloc(self, ent);   /*  ←—— one call, all checks done */
+    if (ufd == -1) { k_close(kfd); free(ent); return -1; }
+
+    return ufd;
+}
+
+/* ---------- s_read --------------------------------------------------- */
+int s_read(int fd, int n, char *buf)
+{
+    pcb_t *self = k_get_self_pcb();
+    proc_fd_entry_t *ent;
+    if (pcb_fd_get(self, fd, &ent) == -1)      /* sets errno → EBADF   */
+        return -1;
+
+    int rc = k_read(ent->kfd, n, buf);         /* PennFAT call         */
+    if (rc < 0) { errno = xlate_err(rc); return -1; }
+    return rc;                                 /* bytes read           */
+}
+
+/* ---------- s_write -------------------------------------------------- */
+int s_write(int fd, const char *buf, int n)
+{
+    pcb_t *self = k_get_self_pcb();
+    proc_fd_entry_t *ent;
+    if (pcb_fd_get(self, fd, &ent) == -1)       /* EBADF               */
+        return -1;
+
+    int rc = k_write(ent->kfd, buf, n);
+    if (rc < 0) { errno = xlate_err(rc); return -1; }
+    return rc;
+}
+
+
+/* ---------- s_close -------------------------------------------------- */
+int s_close(int fd)
+{
+    pcb_t *self = k_get_self_pcb();
+    proc_fd_entry_t *ent;
+    if (pcb_fd_get(self, fd, &ent) == -1)
+        return -1;                              /* EBADF already set   */
+
+    int rc = k_close(ent->kfd);
+    free(ent);
+    pcb_fd_close(self, fd);                      /* helper ← sets slot NULL */
+
+    if (rc < 0) { errno = xlate_err(rc); return -1; }
+    return 0;
+}
+
+/* ---------- s_lseek -------------------------------------------------- */
+int s_lseek(int fd, int off, int whence)
+{
+    pcb_t *self = k_get_self_pcb();
+    proc_fd_entry_t *ent;
+    if (pcb_fd_get(self, fd, &ent) == -1)
+        return -1;
+
+    int rc = k_lseek(ent->kfd, off, whence);
+    if (rc < 0) { errno = xlate_err(rc); return -1; }
+    return rc;                                  /* new offset          */
+}
 
 PennFatErr s_touch(const char *p){ return k_touch(p); }
 PennFatErr s_ls   (const char *p){ return k_ls   (p); }
@@ -166,9 +243,10 @@ int s_rename(const char *o,const char *n){
     return 0;
 }
 
-int s_unlink(const char *p){
-    PennFatErr r = k_unlink(p);
-    if(r!=PennFatErr_OK){ map_errno(r); return -1; }
+int s_unlink(const char *p)
+{
+    int r = k_unlink(p);
+    if (r != PennFatErr_OK) { errno = xlate_err(r); return -1; }
     return 0;
 }
 
