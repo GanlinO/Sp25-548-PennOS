@@ -1335,7 +1335,7 @@ static void process_deathbed(pcb_t* proc) {
   logger_log(logger, LOG_LEVEL_DEBUG,
     "Triggering INIT adoption for PID[%d] (%zu children, %zu waitable_children)",
     proc->pid, vec_len(&proc->children), vec_len(&proc->waitable_children));
-  init_adopt_children(proc);
+  // init_adopt_children(proc);
 
 }
 
@@ -1606,11 +1606,11 @@ pid_t k_waitpid(pid_t pid, int* wstatus, bool nohang) {
       // log lifetime event just before the pcb cleanup (as data will be lost after reaping)
       lifecycle_event_log(waited_child, "WAITED", (self_pcb->pid == INIT_PID) ? "(by init)" : NULL);
 
-      // if waited child has terminated (zombie), reap it
-      if (waited_child->state == PROCESS_STATE_ZOMBIED) {
-        k_proc_cleanup(waited_child);
-        
-      }
+      init_adopt_children(waited_child);
+
+      if (waited_child->state == PROCESS_STATE_ZOMBIED || waited_child->state == PROCESS_STATE_TERMINATED) {
+             k_proc_cleanup(waited_child);
+             }
 
       return waited_child_pid;
 

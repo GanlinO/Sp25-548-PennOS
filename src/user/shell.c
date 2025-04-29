@@ -577,7 +577,7 @@ void* kill_cmd(void* arg) {            /* ➋ renamed implementation   */
   }
 
   if (s_kill(pid, signal) == 0) {
-    fprintf(stderr, "Signal <%d> sent to PID [%d].\n", signal, pid);
+    // fprintf(stderr, "Signal <%d> sent to PID [%d].\n", signal, pid);
   } else {
     // TODO: errno checking, more verbose error explanation
     fprintf(stderr, "Error sending signal to PID [%d].\n", pid);
