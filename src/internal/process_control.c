@@ -42,7 +42,7 @@ void *spawn_entry_wrapper(void *raw);   /* symbol lives in user land */
 #define SECOND_IN_USEC (1000000)
 #define CLOCK_TICK_IN_USEC (100 * MILLISECOND_IN_USEC)
 
-#define INIT_PROCESS_NAME "INIT"
+#define INIT_PROCESS_NAME "init"
 #define DEFAULT_PROCESS_NAME "(unknown)"
 
 #define PROCESS_CONTROL_MODULE_NAME "PROCESS_CONTROL"
@@ -376,7 +376,7 @@ sigdelset(&suspend_set, SIGTSTP);
   /* drop the lock we still hold when we break out of the loop */
   assert_non_negative(pthread_mutex_unlock(&shutdown_mtx),
                     "kernel_scheduler final unlock");
-  logger_log(logger, LOG_LEVEL_INFO, "kernel_scheduler concludes");
+  logger_log(logger, LOG_LEVEL_DEBUG, "kernel_scheduler concludes");
 }
 
 /**
@@ -440,6 +440,8 @@ static void create_init(void* (*starting_shell_func)(void*), void* starting_shel
   pcb_t* pcb_ptr = create_pcb(INIT_PID, NULL);
   assert_non_null(pcb_ptr, "pcb_ptr null in create_init");
 
+  pcb_ptr->priority = PRIORITY_1;
+
   set_pcb_at_pid(INIT_PID, pcb_ptr);
 
 
@@ -499,26 +501,22 @@ static void* init_routine(void* arg)
     /* give the shell terminal control */
     term_ctrl_pid = starting_shell_pid;
 
+        /* give the shell its final, lower-case command name                */
     if (strcmp(starting_shell_pcb->process_name, DEFAULT_PROCESS_NAME) == 0)
-        set_process_name(starting_shell_pcb, "SHELL");
+        set_process_name(starting_shell_pcb, "shell");
 
     /* ───── wait until the shell terminates ──────────────────────── */
+    /* Block until *any* child changes state – this puts INIT into
+       PROCESS_STATE_BLOCKED and keeps it there most of the time.   */
     int st;
     while (true) {
-      errno = 0;
-      pid_t waited = k_waitpid(-1, &st, true);    /* NOHANG = true */
-      
-      if (waited == starting_shell_pid &&
-                    (P_WIFEXITED(st) || P_WIFSIGNALED(st))) /* only EXIT/TERM */
-                    break;                                  /* shell ended    */
+        pid_t waited = k_waitpid(-1, &st, false);   /* NOHANG = false → block */
 
-  
-      if (waited == -1 && errno == ECHILD)        /* POSIX style          */
-          break;
-  
-      /* nothing to do – yield for one tick so we don’t busy-loop         */
-      k_sleep(1);
-  }
+        if (waited == starting_shell_pid &&
+            (P_WIFEXITED(st) || P_WIFSIGNALED(st)))
+            break;                         /* shell ended */
+        /* otherwise loop to wait for next change */
+    }
 
     logger_log(logger, LOG_LEVEL_DEBUG, "INIT triggering shutdown");
     k_shutdown();
@@ -1349,7 +1347,7 @@ static void schedule_event_log(pcb_t *p, schedule_priority q)
     if (!p) return;
 
     /* keep the line format identical – just lower the level            */
-    logger_log(logger, LOG_LEVEL_DEBUG,
+    logger_log(logger, LOG_LEVEL_INFO,
                "[%d]\tSCHEDULE\t%d\t%d\t%s",
                clock_tick,
               p->pid,
@@ -1368,7 +1366,7 @@ static void lifecycle_event_log(pcb_t *p,
 if (!p || !event) return;
 
 /* [ticks] EVENT PID NICE_VALUE PROCESS_NAME [extra] */
-logger_log(logger, LOG_LEVEL_DEBUG, // instead of LOG_LEVEL_INFO
+logger_log(logger, LOG_LEVEL_INFO, // instead of LOG_LEVEL_INFO
 "[%d]\t%s\t%d\t%d\t%s%s%s",
 clock_tick,
 event,
@@ -1396,7 +1394,7 @@ static void nice_event_log(pcb_t *p, int old_pri, int new_pri)
 static void block_event_log(pcb_t *p, const char *event)
 {
     if (!p || !event) return;
-    logger_log(logger, LOG_LEVEL_DEBUG,
+    logger_log(logger, LOG_LEVEL_INFO,
                "[%d]\t%s\t%d\t%d\t%s",
                clock_tick,
                event,
@@ -1803,6 +1801,9 @@ void k_printprocess() {
       case PROCESS_STATE_READY:
         stat = 'R';
         break;
+              case PROCESS_STATE_ZOMBIED:
+        stat = 'Z';
+        break;
       case PROCESS_STATE_STOPPED:
         stat = 'S';
         break;
@@ -1810,7 +1811,7 @@ void k_printprocess() {
         stat = 'B';
         break;
       case PROCESS_STATE_TERMINATED:
-        stat = 'Z';
+      stat = 'T';            /* optional: “T” for fully-reaped        */
         break;
       default:
         stat = 'U';

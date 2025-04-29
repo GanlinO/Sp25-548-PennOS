@@ -5,6 +5,7 @@
 #include "../util/utils.h"
 #include "jobs.h"
 #include <signal.h>
+#include <unistd.h> 
 
 #include "../internal/pennfat_kernel.h"
 #include "../common/pennfat_definitions.h"
@@ -90,6 +91,7 @@ static char* buf = NULL;
 static int   buf_len = 0;
 static bool  exit_shell = false;
 static pid_t shell_pgid;                /* for signal-forwarding */
+static pid_t fg_pid = 0;          /* == 0  → no foreground job right now  */
 
 static struct parsed_command* read_command();
 static pid_t process_one_command(char ***cmdv, size_t stages,
@@ -286,12 +288,27 @@ void* man(void* arg)
   return NULL;
 }
 
-// static void forward(int signo)
-// {
-//     job_t *fg = jobs_current_fg();
-//     if (fg)
-//         s_kill(fg->pid, (signo == SIGINT) ? P_SIGTERM : P_SIGSTOP);  /* fixed */
-// }
+static void forward(int signo)
+{
+    if (fg_pid > 0) {
+        s_kill(fg_pid,
+               (signo == SIGINT) ? P_SIGTERM : P_SIGSTOP);
+    }
+     write(STDERR_FILENO, "\n", 1);      /* put prompt on next line */
+ }
+
+static void shell_install_handlers(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = forward;
+    sigemptyset(&sa.sa_mask);
+     /* read() in prompt loop */
+    sa.sa_flags = SA_RESTART;
+
+    sigaction(SIGINT,  &sa, NULL);     /* Ctrl-C  */
+    sigaction(SIGTSTP, &sa, NULL);     /* Ctrl-Z  */
+}
 
 /*======================================================================*/
 /*  Data-moving built-ins: cp / mv / rm                                 */
@@ -381,7 +398,8 @@ void* shell_main(void* arg) {
   
   shell_pgid = s_getselfpid();
   assert_non_negative(shell_pgid, "Shell PID invalid");
-  jobs_init();                                   /* step 6 */
+  jobs_init();
+  shell_install_handlers();                                     /* step 6 */
 
   while (!exit_shell) {
         /* ── 1. reap all dead children synchronously (NOHANG) ─────────── */
@@ -455,11 +473,17 @@ if (cmd->stdout_file) {
     if (child_pid <= 0) continue;
 
     if (!cmd->is_background) {            /* foreground job           */
+      fg_pid = child_pid;                 /* record for signal fwd    */
       s_tcsetpid(child_pid);
       s_waitpid(child_pid, NULL, false);
       s_tcsetpid(shell_pgid);
+      fg_pid = 0;                         /* no FG job any more       */
     } else {
-      /* TODO: store background job info */
+              /* 1. register in job table */
+              int jid = jobs_add(child_pid, buf, true);
+
+              /* 2. print the “[jid] pid” line */
+              fprintf(stderr, "[%d] %d\n", jid, (int)child_pid);
 
     }
 

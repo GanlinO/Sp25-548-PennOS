@@ -66,8 +66,6 @@ int main(int argc, char *argv[])
     /**********************************************************************
      * 3.  start kernel + shell                                           *
      *********************************************************************/
-    Logger *logger = logger_init_stderr(LOG_LEVEL_INFO, "KERNEL");
-    k_set_logger(logger);
 
         fprintf(stderr, "Starting kernel …\n");
         /* start kernel – its own INIT (PID 1) will run shell_main() */
